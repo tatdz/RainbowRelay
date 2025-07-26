@@ -12,11 +12,10 @@ import { tcp } from '@libp2p/tcp'
 import { noise } from '@chainsafe/libp2p-noise'
 import { mplex } from '@libp2p/mplex'
 import { gossipsub } from '@chainsafe/libp2p-gossipsub'
-import { identify } from '@libp2p/identify'       // identify() factory
+import { identify } from '@libp2p/identify'
 import { mdns } from '@libp2p/mdns'
 
 import { LevelBlockstore } from 'blockstore-level'
-// Correct: named import, NOT default
 import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 
 dotenv.config()
@@ -32,7 +31,7 @@ function encryptOrder(order, secret) {
   const cipher = crypto.createCipheriv(
     'aes-256-ctr',
     Buffer.from(secret, 'utf8'),
-    Buffer.alloc(16, 0) // IV: 16 zero bytes
+    Buffer.alloc(16, 0),
   )
   const encrypted = Buffer.concat([
     cipher.update(JSON.stringify(order)),
@@ -47,7 +46,7 @@ function decryptOrder(encryptedHex, secret) {
   const decipher = crypto.createDecipheriv(
     'aes-256-ctr',
     Buffer.from(secret, 'utf8'),
-    Buffer.alloc(16, 0)
+    Buffer.alloc(16, 0),
   )
   const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
   return JSON.parse(decrypted.toString())
@@ -60,14 +59,8 @@ let ordersCache = []
 let pubsubSubscribed = null
 
 async function startHeliaNode() {
-  // Create delegated routing factory with endpoint
-  const delegatedRoutingFactory = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
-
-  // Debug wrapper to confirm delegated routing factory is called properly by libp2p
-  function delegatedRoutingDebugFactory(components) {
-    console.log('delegatedRoutingDebugFactory called with components:', components)
-    return delegatedRoutingFactory(components)
-  }
+  // Create delegated routing client instance once
+  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
 
   libp2pNode = await createLibp2p({
     addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
@@ -78,7 +71,7 @@ async function startHeliaNode() {
       identify: identify(),
       pubsub: gossipsub(),
       mdns: mdns({ interval: 10000 }),
-      delegatedRouting: delegatedRoutingDebugFactory,
+      delegatedRouting, // Pass instance directly
     },
     connectionManager: { minConnections: 25, maxConnections: 100 },
   })
@@ -86,13 +79,14 @@ async function startHeliaNode() {
   await libp2pNode.start()
   console.log('Libp2p started with peerId:', libp2pNode.peerId.toString())
 
-  await new Promise((resolve) => setTimeout(resolve, 100)) // wait for libp2p warming up
+  await new Promise(resolve => setTimeout(resolve, 100))
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
   heliaNode = await createHelia({
     libp2p: libp2pNode,
     blockstore,
+    contentRouting: delegatedRouting,
   })
 
   console.log('Helia blockstore:', heliaNode.blockstore.constructor.name)
@@ -105,7 +99,6 @@ async function startHeliaNode() {
       try {
         const dataStr = msg.data.toString()
         let received
-
         if (process.env.ENCRYPTION_KEY) {
           try {
             received = decryptOrder(dataStr, process.env.ENCRYPTION_KEY)
@@ -124,7 +117,7 @@ async function startHeliaNode() {
         knownOrderHashes.add(orderHash)
         ordersCache.push(received)
 
-        libp2pNode.services.pubsub.publish('orders', Buffer.from(JSON.stringify(received))).catch((err) => {
+        libp2pNode.services.pubsub.publish('orders', Buffer.from(JSON.stringify(received))).catch(err => {
           if (err.message === 'PublishError.NoPeersSubscribedToTopic') {
             console.warn('Publish warning:', err.message)
           } else {
@@ -140,14 +133,11 @@ async function startHeliaNode() {
   })
 }
 
-/**
- * Store orders in Helia blockstore and provide CID on IPFS network
- * @param {Array} orders
- * @returns {Promise<string>} The CID string
- */
+// Store orders in Helia blockstore and announce CID on IPFS
 async function syncOrdersToIPFS(orders) {
-  if (!heliaNode || !heliaNode.blockstore)
+  if (!heliaNode || !heliaNode.blockstore) {
     throw new Error('Helia or blockstore not initialized')
+  }
 
   const encoded = new TextEncoder().encode(JSON.stringify(orders))
   const cid = await heliaNode.blockstore.put(encoded)
@@ -158,7 +148,7 @@ async function syncOrdersToIPFS(orders) {
   if (heliaNode.contentRouting?.provide) {
     try {
       await heliaNode.contentRouting.provide(cid)
-      console.log('Provided IPFS CID on the network:', cid.toString())
+      console.log('Provided IPFS CID on network:', cid.toString())
     } catch (err) {
       console.warn('Failed to provide content routing:', err)
     }
@@ -179,7 +169,6 @@ app.get('/api/orders', async (_req, res) => {
       console.warn('Blockstore returned no data for CID:', ipfsOrdersCID)
       return res.json(ordersCache)
     }
-
     const data = new TextDecoder().decode(bytes)
     return res.json(JSON.parse(data))
   } catch (err) {
@@ -203,9 +192,9 @@ app.post('/api/orders', async (req, res) => {
     if (order && signature) {
       const storedOrder = encrypted
         ? {
-            encrypted: true,
-            data: encryptOrder({ order, signature, metadata }, encryptKey || process.env.ENCRYPTION_KEY),
-          }
+          encrypted: true,
+          data: encryptOrder({ order, signature, metadata }, encryptKey || process.env.ENCRYPTION_KEY),
+        }
         : { order, signature, metadata }
 
       newOrders.push(storedOrder)
@@ -255,7 +244,7 @@ app.post('/api/gasless-fill', async (req, res) => {
 
 app.listen(PORT, async () => {
   try {
-    // Uncomment below to clear Helia blockstore DB if needed
+    // Uncomment to clear Helia blockstore DB folder if needed
     // import { rmSync } from 'fs'
     // rmSync('./helia-blockstore-db', { recursive: true, force: true })
 
@@ -267,7 +256,6 @@ app.listen(PORT, async () => {
   }
 })
 
-// Graceful shutdown on SIGINT (Ctrl+C)
 process.on('SIGINT', async () => {
   console.log('Shutdown initiated.')
   try {
