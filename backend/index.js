@@ -12,10 +12,11 @@ import { tcp } from '@libp2p/tcp'
 import { noise } from '@chainsafe/libp2p-noise'
 import { mplex } from '@libp2p/mplex'
 import { gossipsub } from '@chainsafe/libp2p-gossipsub'
-import { identify } from '@libp2p/identify' // identify() factory
+import { identify } from '@libp2p/identify'       // identify() factory
 import { mdns } from '@libp2p/mdns'
 
 import { LevelBlockstore } from 'blockstore-level'
+// Correct: named import, NOT default
 import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 
 dotenv.config()
@@ -59,8 +60,14 @@ let ordersCache = []
 let pubsubSubscribed = null
 
 async function startHeliaNode() {
-  // Create delegated routing client factory (do not call)
-  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+  // Create delegated routing factory with endpoint
+  const delegatedRoutingFactory = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+
+  // Debug wrapper to confirm delegated routing factory is called properly by libp2p
+  function delegatedRoutingDebugFactory(components) {
+    console.log('delegatedRoutingDebugFactory called with components:', components)
+    return delegatedRoutingFactory(components)
+  }
 
   libp2pNode = await createLibp2p({
     addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
@@ -68,10 +75,10 @@ async function startHeliaNode() {
     connectionEncryption: [noise()],
     streamMuxers: [mplex()],
     services: {
-      identify: identify(),              // Call identify() here
+      identify: identify(),
       pubsub: gossipsub(),
       mdns: mdns({ interval: 10000 }),
-      delegatedRouting,                  // Pass delegated routing factory here
+      delegatedRouting: delegatedRoutingDebugFactory,
     },
     connectionManager: { minConnections: 25, maxConnections: 100 },
   })
@@ -79,8 +86,7 @@ async function startHeliaNode() {
   await libp2pNode.start()
   console.log('Libp2p started with peerId:', libp2pNode.peerId.toString())
 
-  // Small delay for libp2p internals
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await new Promise((resolve) => setTimeout(resolve, 100)) // wait for libp2p warming up
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
@@ -118,7 +124,6 @@ async function startHeliaNode() {
         knownOrderHashes.add(orderHash)
         ordersCache.push(received)
 
-        // Rebroadcast to pubsub mesh with error handling
         libp2pNode.services.pubsub.publish('orders', Buffer.from(JSON.stringify(received))).catch((err) => {
           if (err.message === 'PublishError.NoPeersSubscribedToTopic') {
             console.warn('Publish warning:', err.message)
@@ -136,14 +141,13 @@ async function startHeliaNode() {
 }
 
 /**
- * Stores orders in Helia's blockstore and announces via content routing
+ * Store orders in Helia blockstore and provide CID on IPFS network
  * @param {Array} orders
- * @returns {Promise<string>} IPFS CID string of stored orders
+ * @returns {Promise<string>} The CID string
  */
 async function syncOrdersToIPFS(orders) {
-  if (!heliaNode || !heliaNode.blockstore) {
+  if (!heliaNode || !heliaNode.blockstore)
     throw new Error('Helia or blockstore not initialized')
-  }
 
   const encoded = new TextEncoder().encode(JSON.stringify(orders))
   const cid = await heliaNode.blockstore.put(encoded)
@@ -171,7 +175,6 @@ app.get('/api/orders', async (_req, res) => {
   try {
     const cid = CID.parse(ipfsOrdersCID)
     const bytes = await heliaNode.blockstore.get(cid)
-
     if (!bytes) {
       console.warn('Blockstore returned no data for CID:', ipfsOrdersCID)
       return res.json(ordersCache)
@@ -252,7 +255,7 @@ app.post('/api/gasless-fill', async (req, res) => {
 
 app.listen(PORT, async () => {
   try {
-    // Uncomment below to clear Helia blockstore DB if you want a fresh start
+    // Uncomment below to clear Helia blockstore DB if needed
     // import { rmSync } from 'fs'
     // rmSync('./helia-blockstore-db', { recursive: true, force: true })
 

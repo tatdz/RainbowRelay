@@ -4,7 +4,7 @@ import { tcp } from '@libp2p/tcp'
 import { noise } from '@chainsafe/libp2p-noise'
 import { mplex } from '@libp2p/mplex'
 import { gossipsub } from '@chainsafe/libp2p-gossipsub'
-import { identify } from '@libp2p/identify' // identify() factory function
+import { identify } from '@libp2p/identify'           // identify() factory function
 import { mdns } from '@libp2p/mdns'
 
 import { LevelBlockstore } from 'blockstore-level'
@@ -17,8 +17,12 @@ import { sha256 } from 'multiformats/hashes/sha2'
 async function testHelia() {
   console.log('Starting libp2p node...')
 
-  // Delegated routing factory (do not call it here)
-  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+  const delegatedRoutingFactory = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+
+  function delegatedRoutingDebugFactory(components) {
+    console.log('delegatedRoutingDebugFactory called with components:', components)
+    return delegatedRoutingFactory(components)
+  }
 
   const libp2pNode = await createLibp2p({
     addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
@@ -26,18 +30,17 @@ async function testHelia() {
     connectionEncryption: [noise()],
     streamMuxers: [mplex()],
     services: {
-      identify: identify(),               // Call the factory here
+      identify: identify(),
       pubsub: gossipsub(),
       mdns: mdns({ interval: 10000 }),
-      delegatedRouting,                  // Pass delegated routing factory directly
+      delegatedRouting: delegatedRoutingDebugFactory,
     },
   })
 
   await libp2pNode.start()
   console.log('libp2p started with peerId:', libp2pNode.peerId.toString())
 
-  // Allow libp2p internals to initialize
-  await new Promise(resolve => setTimeout(resolve, 100))
+  await new Promise((resolve) => setTimeout(resolve, 100))
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
@@ -52,18 +55,15 @@ async function testHelia() {
     console.log('Helia contentRouting enabled.')
   }
 
-  // Encode a small IPLD dag-cbor block with "hello world"
   const block = await Block.encode({
     value: 'hello world',
     codec: dagCbor,
     hasher: sha256,
   })
 
-  // Store block bytes
   const cid = await heliaNode.blockstore.put(block.cid, block.bytes)
   console.log('Stored block with CID:', cid.toString())
 
-  // Provide the CID on the delegated routing network
   if (heliaNode.contentRouting?.provide) {
     try {
       await heliaNode.contentRouting.provide(cid)
@@ -75,7 +75,6 @@ async function testHelia() {
     console.warn('contentRouting.provide() is not available.')
   }
 
-  // Close LevelDB cleanly
   try {
     if (heliaNode.blockstore.child?.child?.close) {
       await heliaNode.blockstore.child.child.close()
@@ -85,7 +84,6 @@ async function testHelia() {
     console.warn('Error closing LevelDB:', e)
   }
 
-  // Stop nodes cleanly
   await heliaNode.stop()
   await libp2pNode.stop()
   console.log('Helia and libp2p nodes stopped. Test complete.')
