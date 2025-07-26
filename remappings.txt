@@ -1,0 +1,3 @@
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+solidity-utils/=lib/solidity-utils/
+forge-std/=lib/forge-std/src/
