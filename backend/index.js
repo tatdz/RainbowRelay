@@ -2,116 +2,106 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import crypto from 'crypto'
-import fetch from 'node-fetch'
-
-import { createLibp2p } from 'libp2p'
 import { createHelia } from 'helia'
+import { createLibp2p } from 'libp2p'
 import { LevelBlockstore } from 'blockstore-level'
-import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 import { CID } from 'multiformats/cid'
+import * as raw from 'multiformats/codecs/raw'
+import { sha256 } from 'multiformats/hashes/sha2'
+import { encode, decode } from 'multiformats/block'
+import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
+
+// libp2p modules
+import { tcp } from '@libp2p/tcp'
+import { noise } from '@chainsafe/libp2p-noise'
+import { mplex } from '@libp2p/mplex'
+import { identify } from '@libp2p/identify'
+import { gossipsub } from '@chainsafe/libp2p-gossipsub'
+import { mdns } from '@libp2p/mdns'
 
 dotenv.config()
 
 const app = express()
 const PORT = process.env.PORT || 3000
-let heliaNode, libp2pNode, ipfsOrdersCID = null, ordersCache = []
+let heliaNode, libp2pNode, ipfsCID = null, cache = []
 
 app.use(cors())
 app.use(express.json())
 
-function encryptOrder(order, secret) {
-  const cipher = crypto.createCipheriv('aes-256-ctr', Buffer.from(secret, 'utf8'), Buffer.alloc(16, 0))
-  return Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()]).toString('hex')
-}
-
-function decryptOrder(encryptedHex, secret) {
-  const encrypted = Buffer.from(encryptedHex, 'hex')
-  const decipher = crypto.createDecipheriv('aes-256-ctr', Buffer.from(secret, 'utf8'), Buffer.alloc(16, 0))
-  return JSON.parse(Buffer.concat([decipher.update(encrypted), decipher.final()]).toString())
-}
-
 async function startNode() {
-  const delegatedClient = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
+
   const libp2p = await createLibp2p({
     addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
     connectionEncryption: [noise()],
     streamMuxers: [mplex()],
     services: {
-      delegatedRouting: () => delegatedClient,
       identify: identify(),
       pubsub: gossipsub(),
-      mdns: mdns({ interval: 10000 })
+      mdns: mdns({ interval: 10000 }),
+      delegatedRouting: () => delegatedRouting
     }
   })
+
   await libp2p.start()
-  console.log('Libp2p started with peerId:', libp2p.peerId.toString())
   libp2pNode = libp2p
-  heliaNode = await createHelia({
-    libp2p,
-    blockstore: new LevelBlockstore('./helia-blockstore-db')
-  })
-  console.log('Helia contentRouting:', heliaNode.contentRouting ? '✅ enabled' : '❌ undefined')
+  console.log('✅ Libp2p started with peerId:', libp2p.peerId.toString())
+
+  const blockstore = new LevelBlockstore('./helia-blockstore-db')
+  heliaNode = await createHelia({ libp2p, blockstore })
+
+  console.log('✅ Helia contentRouting:', heliaNode.contentRouting ? '✔️ enabled' : '❌ unavailable')
 }
-  
-async function syncOrdersToIPFS(orders) {
-  const encoded = new TextEncoder().encode(JSON.stringify(orders))
-  const cid = await heliaNode.blockstore.put(encoded)
-  ipfsOrdersCID = cid.toString()
-  ordersCache = orders
+
+async function syncToIPFS(data) {
+  const encoded = new TextEncoder().encode(JSON.stringify(data))
+  const block = await encode({ value: encoded, codec: raw, hasher: sha256 })
+
+  await heliaNode.blockstore.put(block.cid, block.bytes)
+  ipfsCID = block.cid.toString()
+  cache = data
+
   if (heliaNode.contentRouting?.provide) {
-    try { await heliaNode.contentRouting.provide(cid); console.log('CID provided:', cid.toString()) }
-    catch (err) { console.warn('Provide failed:', err) }
-  } else {
-    console.warn('No contentRouting.provide(), skipped provide')
+    try {
+      await heliaNode.contentRouting.provide(block.cid)
+      console.log('📡 CID provided:', block.cid.toString())
+    } catch (err) {
+      console.error('Failed to provide CID:', err)
+    }
   }
-  return ipfsOrdersCID
+
+  return ipfsCID
 }
 
-app.get('/api/orders', async (_req, res) => {
-  if (!ipfsOrdersCID) return res.json([])
+app.get('/api', async (_req, res) => {
+  if (!ipfsCID) return res.json([])
+
   try {
-    const cid = CID.parse(ipfsOrdersCID)
+    const cid = CID.parse(ipfsCID)
     const bytes = await heliaNode.blockstore.get(cid)
-    const data = bytes ? JSON.parse(new TextDecoder().decode(bytes)) : ordersCache
-    return res.json(data)
+    const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
+    res.json(JSON.parse(new TextDecoder().decode(block.value)))
   } catch (err) {
-    console.warn('Fetch error:', err)
-    return res.json(ordersCache)
+    console.error('Read error:', err)
+    res.status(500).json({ error: 'Failed to read data' })
   }
 })
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api', async (req, res) => {
   try {
-    const { orders, order, signature, metadata, encrypted = false, encryptKey = '' } = req.body
-    if (!orders && !order) return res.status(400).json({ error: 'Missing orders or order payload' })
-    let newOrders = orders ? [...orders] : [...ordersCache]
-    if (order && signature) {
-      const stored = encrypted
-        ? { encrypted: true, data: encryptOrder({ order, signature, metadata }, encryptKey || process.env.ENCRYPTION_KEY) }
-        : { order, signature, metadata }
-      newOrders.push(stored)
-      if (libp2pNode.services.pubsub) {
-        await libp2pNode.services.pubsub.publish('orders', Buffer.from(encrypted ? stored.data : JSON.stringify(stored)))
-      }
-    }
-    const newCID = await syncOrdersToIPFS(newOrders)
-    return res.json({ success: true, ipfsCID: newCID })
+    const newData = req.body
+    const cid = await syncToIPFS(newData)
+    res.json({ success: true, cid })
   } catch (err) {
-    console.error('Sync error:', err)
-    return res.status(500).json({ error: err.message })
+    console.error('Write error:', err)
+    res.status(500).json({ error: 'Failed to sync data' })
   }
 })
 
-app.listen(PORT, () => {
-  startNode().then(() => console.log(`🚀 Server listening at http://localhost:${PORT}`))
-  .catch(err => { console.error('Startup error:', err); process.exit(1) })
-})
-
-process.on('SIGINT', async () => {
-  await heliaNode?.stop()
-  await libp2pNode?.stop()
-  console.log('Shutdown complete')
-  process.exit(0)
-})
+startNode()
+  .then(() => app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`)))
+  .catch(err => {
+    console.error('Startup error:', err)
+    process.exit(1)
+  })
