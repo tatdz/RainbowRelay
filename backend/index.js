@@ -66,24 +66,23 @@ async function onOrdersProtocol({ stream }) {
     const decoder = new TextDecoder()
     let data = ''
     for await (const chunk of stream.source) {
-      // Handle Uint8ArrayList or Uint8Array chunks
+      // Convert Uint8ArrayList or similar to Uint8Array before decoding
       let bufferToDecode
       if (typeof chunk.slice === 'function') {
-        // Uint8ArrayList or similar, get contiguous Uint8Array
-        bufferToDecode = chunk.slice()
+        bufferToDecode = chunk.slice() // converts to Uint8Array
       } else {
-        // Fallback plain Uint8Array or Buffer
         bufferToDecode = chunk
       }
       data += decoder.decode(bufferToDecode, { stream: true })
     }
-    data += decoder.decode() // flush
+    data += decoder.decode() // flush decoder buffer
 
     let order
     if (ENCRYPTION_KEY) {
       try {
         order = decryptOrder(data, ENCRYPTION_KEY)
       } catch (e) {
+        // Fallback parse JSON if decryption fails
         try {
           order = JSON.parse(data)
         } catch (parseErr) {
@@ -109,6 +108,7 @@ async function onOrdersProtocol({ stream }) {
 async function connectToPeer(multiaddrStr) {
   try {
     let maddr = multiaddr(multiaddrStr)
+
     if (!maddr.getPeerId()) {
       const peerIdStr = multiaddrStr.split('/p2p/')[1]
       if (peerIdStr) {
@@ -116,14 +116,21 @@ async function connectToPeer(multiaddrStr) {
       }
     }
 
+    // Prevent dialing self
+    if (maddr.getPeerId() === libp2pNode.peerId.toString()) {
+      throw new Error('Attempted to dial self peer ID, which is not allowed')
+    }
+
     console.log(`Dialing peer at: ${maddr.toString()}`)
+
     const connection = await libp2pNode.dial(maddr)
     console.log('Connection established:', connection.remoteAddr.toString())
 
-    const { stream } = await connection.newStream([PROTOCOL])
+    // newStream returns stream directly, do not destructure
+    const stream = await connection.newStream([PROTOCOL])
     console.log('Protocol stream opened')
 
-    if (stream.sink) await stream.sink([])
+    // Close the stream politely
     if (stream.close) await stream.close()
 
     return true
