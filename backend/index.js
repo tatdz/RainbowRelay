@@ -1,6 +1,8 @@
 import crypto from 'crypto'
 import dotenv from 'dotenv'
 import express from 'express'
+import JSONParser from 'jsonparse'
+
 
 import { pipe } from 'it-pipe'
 import { createLibp2p } from 'libp2p'
@@ -62,46 +64,61 @@ function decryptOrder(encryptedHex, secret) {
 
 // Protocol handler for /orders/1.0.0 streams
 async function onOrdersProtocol({ stream }) {
-  try {
-    const decoder = new TextDecoder()
-    let data = ''
-    for await (const chunk of stream.source) {
-      // Convert Uint8ArrayList or similar to Uint8Array before decoding
-      let bufferToDecode
-      if (typeof chunk.slice === 'function') {
-        bufferToDecode = chunk.slice() // converts to Uint8Array
-      } else {
-        bufferToDecode = chunk
-      }
-      data += decoder.decode(bufferToDecode, { stream: true })
-    }
-    data += decoder.decode() // flush decoder buffer
+  return new Promise((resolve) => {
+    const parser = new JSONParser()
+    let order = null
+    const chunks = []
 
-    let order
-    if (ENCRYPTION_KEY) {
+    parser.onValue = function (value) {
+      // When a full JSON object is parsed at root level:
+      if (this.stack.length === 0) {
+        order = value
+      }
+    }
+
+    parser.onError = function (err) {
+      console.error('JSON parse error in streaming protocol:', err)
+      resolve() // end processing on error
+    }
+
+    // Collect chunks and feed parser
+    ;(async () => {
       try {
-        order = decryptOrder(data, ENCRYPTION_KEY)
-      } catch (e) {
-        // Fallback parse JSON if decryption fails
-        try {
-          order = JSON.parse(data)
-        } catch (parseErr) {
-          console.error('Failed to parse order JSON after decryption fallback:', parseErr)
-          throw e
+        for await (const chunk of stream.source) {
+          let bufferToParse
+          if (typeof chunk.slice === 'function') {
+            bufferToParse = chunk.slice()
+          } else {
+            bufferToParse = chunk
+          }
+          parser.write(Buffer.from(bufferToParse))
         }
+      } catch (err) {
+        console.error('Error reading stream for protocol:', err)
+      } finally {
+        try {
+          if (order) {
+            let decryptedOrder = order
+            if (ENCRYPTION_KEY) {
+              try {
+                decryptedOrder = decryptOrder(JSON.stringify(order), ENCRYPTION_KEY)
+              } catch {
+                // fallback to original
+              }
+            }
+            const hash = JSON.stringify(decryptedOrder)
+            if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
+              ordersCache.push(decryptedOrder)
+              console.log('📦 Received order via protocol:', decryptedOrder)
+            }
+          }
+        } catch (finalErr) {
+          console.error('Error processing parsed order:', finalErr)
+        }
+        resolve()
       }
-    } else {
-      order = JSON.parse(data)
-    }
-
-    const hash = JSON.stringify(order)
-    if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
-      ordersCache.push(order)
-      console.log('📦 Received order via protocol:', order)
-    }
-  } catch (err) {
-    console.error('Error handling orders protocol:', err)
-  }
+    })()
+  })
 }
 
 // Connect to peer by multiaddr string, append peer ID suffix if missing
