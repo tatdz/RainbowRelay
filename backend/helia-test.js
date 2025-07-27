@@ -1,66 +1,66 @@
-// helia-test.js
 import { createHelia } from 'helia'
 import { createLibp2p } from 'libp2p'
-import { LevelBlockstore } from 'blockstore-level'
-import { CID } from 'multiformats/cid'
-import * as raw from 'multiformats/codecs/raw'
-import { sha256 } from 'multiformats/hashes/sha2'
-import { encode, decode } from 'multiformats/block'
-
-// libp2p modules
 import { tcp } from '@libp2p/tcp'
 import { noise } from '@chainsafe/libp2p-noise'
 import { mplex } from '@libp2p/mplex'
 import { identify } from '@libp2p/identify'
-import { gossipsub } from '@chainsafe/libp2p-gossipsub'
-import { mdns } from '@libp2p/mdns'
+import { ping } from '@libp2p/ping'
+import { unixfs } from '@helia/unixfs'
+import { createBitswap } from '@helia/bitswap'
+import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
+import { CID } from 'multiformats/cid'
 
-async function createNode() {
+const [,, cidStr, multiaddrStr] = process.argv
+
+if (!cidStr || !multiaddrStr) {
+  console.error('❌ Usage: node helia-test.js <CID> <multiaddr>')
+  process.exit(1)
+}
+
+async function main() {
+  // 1. Create libp2p
   const libp2p = await createLibp2p({
-    addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
-    connectionEncryption: [noise()],
     streamMuxers: [mplex()],
+    connectionEncryption: [noise()],
     services: {
       identify: identify(),
-      pubsub: gossipsub(),
-      mdns: mdns({ interval: 10000 })
+      ping: ping()
     }
   })
 
-  console.log('Starting libp2p...')
-  await libp2p.start()
-  console.log('Libp2p peerId:', libp2p.peerId.toString())
+  // 2. Create helia
+  const helia = await createHelia({ libp2p })
 
-  const blockstore = new LevelBlockstore('./helia-blockstore-db')
-  const helia = await createHelia({ libp2p, blockstore })
+  // 3. Create bitswap with helia components
+  const bitswap = createBitswap(helia._libp2p.components)
 
-  console.log('Helia contentRouting:', helia.contentRouting ? '✔️ enabled' : '❌ undefined')
+  // 4. Register bitswap manually
+  helia._libp2p.services.bitswap = bitswap
 
-  return { helia, libp2p }
-}
+  const fs = unixfs(helia)
 
-async function heliaTest() {
-  const { helia, libp2p } = await createNode()
+  console.log(`✅ Test node started with peerId: ${libp2p.peerId.toString()}`)
+  console.log(`🔍 Fetching CID: ${cidStr}`)
+  console.log(`🔌 Dialing backend node at ${multiaddrStr} with protocol /ipfs/bitswap/1.2.0`)
 
   try {
-    const data = new TextEncoder().encode('Hello from Helia test!')
-    const block = await encode({ value: data, codec: raw, hasher: sha256 })
+    await libp2p.dial(multiaddrStr)
+    const cid = CID.parse(cidStr)
+    const file = await fs.cat(cid)
 
-    await helia.blockstore.put(block.cid, block.bytes)
-    console.log('✅ Block stored with CID:', block.cid.toString())
+    let content = ''
+    for await (const chunk of file) {
+      content += uint8ArrayToString(chunk)
+    }
 
-    const resultBytes = await helia.blockstore.get(block.cid)
-    const resultBlock = await decode({ cid: block.cid, bytes: resultBytes, codec: raw, hasher: sha256 })
-    const decoded = new TextDecoder().decode(resultBlock.value)
-    console.log('✅ Block retrieved:', decoded)
+    console.log('✅ Retrieved content:')
+    console.log(content)
   } catch (err) {
-    console.error('Error in heliaTest:', err)
-  } finally {
-    await libp2p.stop()
-    await helia.stop()
-    console.log('Helia and libp2p nodes stopped. Test complete.')
+    console.error('❌ Failed to fetch content:', err)
   }
+
+  await helia.stop()
 }
 
-heliaTest()
+main()

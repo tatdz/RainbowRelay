@@ -1,21 +1,29 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "RainbowRelay backend using Helia and libp2p",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "helia",
+    "libp2p",
+    "ipfs",
+    "unixfs",
+    "backend"
+  ],
+  "author": "Tatiana Dzhambinova",
   "license": "ISC",
   "dependencies": {
     "@chainsafe/libp2p-gossipsub": "^14.1.1",
     "@chainsafe/libp2p-noise": "^16.1.4",
+    "@helia/bitswap": "^2.1.3",
     "@helia/delegated-routing-v1-http-api-client": "^4.2.5",
     "@helia/routers": "^3.1.3",
+    "@helia/unixfs": "^5.0.4",
     "@helia/utils": "^1.4.0",
     "@ipld/dag-cbor": "^9.0.1",
     "@libp2p/identify": "^3.0.38",
@@ -23,7 +31,9 @@
     "@libp2p/kad-dht": "^15.1.10",
     "@libp2p/mdns": "^11.0.46",
     "@libp2p/mplex": "^11.0.46",
+    "@libp2p/peer-id-factory": "^4.2.4",
     "@libp2p/ping": "^2.0.36",
+    "@libp2p/plaintext": "^2.0.28",
     "@libp2p/tcp": "^10.1.18",
     "@libp2p/websockets": "^9.2.18",
     "blockstore-core": "^5.0.4",
