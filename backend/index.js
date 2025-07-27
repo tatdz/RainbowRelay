@@ -22,6 +22,7 @@ import { ping } from '@libp2p/ping'
 import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 
 import { createBitswap } from '@helia/bitswap'
+import { logger as libp2pLogger } from '@libp2p/logger' // <-- import logger
 
 dotenv.config()
 
@@ -73,21 +74,15 @@ async function startNode() {
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
-  // Provide a logger with forComponent() method for Bitswap
-  const logger = {
-    info: () => {},
-    warn: console.warn,
-    error: console.error,
-    debug: () => {},
-    forComponent() {
-      return this
-    }
+  // Patch logger to add forComponent method if missing (required by bitswap)
+  if (typeof libp2pLogger.forComponent !== 'function') {
+    libp2pLogger.forComponent = () => libp2pLogger
   }
 
   bitswap = await createBitswap({
     libp2p: libp2pNode,
     blockstore,
-    logger
+    logger: libp2pLogger
   })
 
   heliaNode = await createHelia({ libp2p: libp2pNode, blockstore, bitswap })
@@ -95,6 +90,7 @@ async function startNode() {
 
   const seenHashes = new Set()
 
+  // Subscribe to pubsub topic 'orders'
   await libp2pNode.services.pubsub.subscribe('orders')
   libp2pNode.services.pubsub.addEventListener('message', async (evt) => {
     try {

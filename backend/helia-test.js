@@ -1,66 +1,87 @@
+import fs from 'fs/promises'
+import process from 'process'
 import { createHelia } from 'helia'
 import { createLibp2p } from 'libp2p'
+import { LevelBlockstore } from 'blockstore-level'
+import { CID } from 'multiformats/cid'
+import { encode, decode } from 'multiformats/block'
+import * as raw from 'multiformats/codecs/raw'
+import { sha256 } from 'multiformats/hashes/sha2'
+
 import { tcp } from '@libp2p/tcp'
 import { noise } from '@chainsafe/libp2p-noise'
 import { mplex } from '@libp2p/mplex'
+import { gossipsub } from '@chainsafe/libp2p-gossipsub'
 import { identify } from '@libp2p/identify'
+import { mdns } from '@libp2p/mdns'
 import { ping } from '@libp2p/ping'
-import { unixfs } from '@helia/unixfs'
-import { createBitswap } from '@helia/bitswap'
-import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import { CID } from 'multiformats/cid'
 
-const [,, cidStr, multiaddrStr] = process.argv
+const CID_FILE = './latest-cid.txt'
 
-if (!cidStr || !multiaddrStr) {
-  console.error('❌ Usage: node helia-test.js <CID> <multiaddr>')
-  process.exit(1)
+async function loadCIDFromFile() {
+  try {
+    const cid = await fs.readFile(CID_FILE, 'utf8')
+    return cid.trim()
+  } catch {
+    return null
+  }
 }
 
-async function main() {
-  // 1. Create libp2p
-  const libp2p = await createLibp2p({
+async function startNode() {
+  const libp2pNode = await createLibp2p({
+    addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
-    streamMuxers: [mplex()],
     connectionEncryption: [noise()],
+    streamMuxers: [mplex()],
     services: {
       identify: identify(),
-      ping: ping()
+      ping: ping(),
+      pubsub: gossipsub(),
+      mdns: mdns({ interval: 10000 }),
     }
   })
 
-  // 2. Create helia
-  const helia = await createHelia({ libp2p })
+  await libp2pNode.start()
 
-  // 3. Create bitswap with helia components
-  const bitswap = createBitswap(helia._libp2p.components)
+  libp2pNode.getMultiaddrs().forEach(addr => {
+    console.log('Listening on:', addr.toString() + '/p2p/' + libp2pNode.peerId.toString())
+  })
 
-  // 4. Register bitswap manually
-  helia._libp2p.services.bitswap = bitswap
+  const blockstore = new LevelBlockstore('./helia-blockstore-db')
+  const heliaNode = await createHelia({ libp2p: libp2pNode, blockstore })
 
-  const fs = unixfs(helia)
+  return { heliaNode, libp2pNode }
+}
 
-  console.log(`✅ Test node started with peerId: ${libp2p.peerId.toString()}`)
-  console.log(`🔍 Fetching CID: ${cidStr}`)
-  console.log(`🔌 Dialing backend node at ${multiaddrStr} with protocol /ipfs/bitswap/1.2.0`)
+async function main() {
+  let [,, cidArg, multiaddr] = process.argv
 
-  try {
-    await libp2p.dial(multiaddrStr)
-    const cid = CID.parse(cidStr)
-    const file = await fs.cat(cid)
-
-    let content = ''
-    for await (const chunk of file) {
-      content += uint8ArrayToString(chunk)
+  if (!cidArg || !multiaddr) {
+    cidArg = await loadCIDFromFile()
+    if (!cidArg) {
+      console.error('❌ Usage: node helia-test.js <CID> <multiaddr>')
+      process.exit(1)
     }
-
-    console.log('✅ Retrieved content:')
-    console.log(content)
-  } catch (err) {
-    console.error('❌ Failed to fetch content:', err)
+    console.log(`ℹ️ Loaded CID from file: ${cidArg}`)
+    console.log(`ℹ️ You must still provide multiaddr as second argument.`)
+    console.log('Usage: node helia-test.js <CID> <multiaddr>')
+    process.exit(1)
   }
 
-  await helia.stop()
+  const { heliaNode, libp2pNode } = await startNode()
+
+  try {
+    const cid = CID.parse(cidArg)
+    const bytes = await heliaNode.blockstore.get(cid)
+    const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
+    const dataStr = new TextDecoder().decode(block.value)
+    console.log('✅ Data fetched from Helia IPFS:', JSON.parse(dataStr))
+  } catch (err) {
+    console.error('Failed to fetch data from IPFS:', err)
+  }
+
+  await libp2pNode.stop()
+  process.exit(0)
 }
 
 main()
