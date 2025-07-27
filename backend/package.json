@@ -45,6 +45,7 @@
     "helia": "^5.5.0",
     "ipfs-unixfs-exporter": "^13.6.6",
     "ipfs-unixfs-importer": "^15.4.0",
+    "it-pipe": "^3.0.1",
     "libp2p": "^2.9.0",
     "multiformats": "^13.3.7",
     "node-fetch": "^3.3.2",
