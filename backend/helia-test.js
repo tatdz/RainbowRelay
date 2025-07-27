@@ -15,11 +15,7 @@ import { identify } from '@libp2p/identify'
 import { mdns } from '@libp2p/mdns'
 import { ping } from '@libp2p/ping'
 
-import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
-
 async function startLibp2p(listenAddrs) {
-  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
-
   const libp2p = await createLibp2p({
     addresses: { listen: listenAddrs || ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
@@ -30,7 +26,6 @@ async function startLibp2p(listenAddrs) {
       ping: ping(),
       pubsub: gossipsub(),
       mdns: mdns({ interval: 10000 }),
-      delegatedRouting: () => delegatedRouting
     }
   })
 
@@ -40,7 +35,7 @@ async function startLibp2p(listenAddrs) {
     console.log('🧭 Listening on:', addr.toString() + '/p2p/' + libp2p.peerId.toString())
   })
 
-  return { libp2p, delegatedRouting }
+  return libp2p
 }
 
 async function main() {
@@ -51,17 +46,18 @@ async function main() {
     process.exit(1)
   }
 
-  const { libp2p, delegatedRouting } = await startLibp2p()
+  const libp2p = await startLibp2p()
 
+  // Create Helia with empty LevelBlockstore (local store for retrieved data)
   const blockstore = new LevelBlockstore('./helia-teststore-db')
   const helia = await createHelia({ libp2p, blockstore })
 
-  // Manually assign delegatedRouting as helia.contentRouting
-  helia.contentRouting = delegatedRouting
-
   try {
     const cid = CID.parse(cidStr)
-    // Try to fetch block from local store (remote fetch requires routing)
+    // Try to fetch block from remote node via bitswap / DHT etc
+    // But Helia doesn’t provide a built-in content routing or bitswap in this example.
+    // So to actually get the block from remote, your node must have the data in local store
+    // For demo, just attempt to get it locally here:
     const bytes = await helia.blockstore.get(cid)
     if (!bytes) throw new Error('Block not found in local blockstore')
 
