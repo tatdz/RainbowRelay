@@ -1,10 +1,9 @@
-import fs from 'fs/promises'
 import process from 'process'
 import { createHelia } from 'helia'
 import { createLibp2p } from 'libp2p'
 import { LevelBlockstore } from 'blockstore-level'
 import { CID } from 'multiformats/cid'
-import { encode, decode } from 'multiformats/block'
+import { decode } from 'multiformats/block'
 import * as raw from 'multiformats/codecs/raw'
 import { sha256 } from 'multiformats/hashes/sha2'
 
@@ -16,20 +15,13 @@ import { identify } from '@libp2p/identify'
 import { mdns } from '@libp2p/mdns'
 import { ping } from '@libp2p/ping'
 
-const CID_FILE = './latest-cid.txt'
+import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 
-async function loadCIDFromFile() {
-  try {
-    const cid = await fs.readFile(CID_FILE, 'utf8')
-    return cid.trim()
-  } catch {
-    return null
-  }
-}
+async function startLibp2p(listenAddrs) {
+  const delegatedRouting = createDelegatedRoutingV1HttpApiClient('https://delegated-ipfs.dev')
 
-async function startNode() {
-  const libp2pNode = await createLibp2p({
-    addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
+  const libp2p = await createLibp2p({
+    addresses: { listen: listenAddrs || ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
     connectionEncryption: [noise()],
     streamMuxers: [mplex()],
@@ -38,49 +30,49 @@ async function startNode() {
       ping: ping(),
       pubsub: gossipsub(),
       mdns: mdns({ interval: 10000 }),
+      delegatedRouting: () => delegatedRouting
     }
   })
 
-  await libp2pNode.start()
+  await libp2p.start()
 
-  libp2pNode.getMultiaddrs().forEach(addr => {
-    console.log('Listening on:', addr.toString() + '/p2p/' + libp2pNode.peerId.toString())
+  libp2p.getMultiaddrs().forEach(addr => {
+    console.log('🧭 Listening on:', addr.toString() + '/p2p/' + libp2p.peerId.toString())
   })
 
-  const blockstore = new LevelBlockstore('./helia-blockstore-db')
-  const heliaNode = await createHelia({ libp2p: libp2pNode, blockstore })
-
-  return { heliaNode, libp2pNode }
+  return { libp2p, delegatedRouting }
 }
 
 async function main() {
-  let [,, cidArg, multiaddr] = process.argv
+  const [,, cidStr, remoteMultiaddr] = process.argv
 
-  if (!cidArg || !multiaddr) {
-    cidArg = await loadCIDFromFile()
-    if (!cidArg) {
-      console.error('❌ Usage: node helia-test.js <CID> <multiaddr>')
-      process.exit(1)
-    }
-    console.log(`ℹ️ Loaded CID from file: ${cidArg}`)
-    console.log(`ℹ️ You must still provide multiaddr as second argument.`)
-    console.log('Usage: node helia-test.js <CID> <multiaddr>')
+  if (!cidStr || !remoteMultiaddr) {
+    console.error('❌ Usage: node helia-test.js <CID> <remote-libp2p-multiaddr>')
     process.exit(1)
   }
 
-  const { heliaNode, libp2pNode } = await startNode()
+  const { libp2p, delegatedRouting } = await startLibp2p()
+
+  const blockstore = new LevelBlockstore('./helia-teststore-db')
+  const helia = await createHelia({ libp2p, blockstore })
+
+  // Manually assign delegatedRouting as helia.contentRouting
+  helia.contentRouting = delegatedRouting
 
   try {
-    const cid = CID.parse(cidArg)
-    const bytes = await heliaNode.blockstore.get(cid)
+    const cid = CID.parse(cidStr)
+    // Try to fetch block from local store (remote fetch requires routing)
+    const bytes = await helia.blockstore.get(cid)
+    if (!bytes) throw new Error('Block not found in local blockstore')
+
     const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
     const dataStr = new TextDecoder().decode(block.value)
-    console.log('✅ Data fetched from Helia IPFS:', JSON.parse(dataStr))
+    console.log('✅ Data fetched:', JSON.parse(dataStr))
   } catch (err) {
-    console.error('Failed to fetch data from IPFS:', err)
+    console.error('Failed to fetch data:', err)
   }
 
-  await libp2pNode.stop()
+  await libp2p.stop()
   process.exit(0)
 }
 

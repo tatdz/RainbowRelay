@@ -22,7 +22,7 @@ import { ping } from '@libp2p/ping'
 import { createDelegatedRoutingV1HttpApiClient } from '@helia/delegated-routing-v1-http-api-client'
 
 import { createBitswap } from '@helia/bitswap'
-import { logger as libp2pLogger } from '@libp2p/logger' // <-- import logger
+import { logger as libp2pLogger } from '@libp2p/logger'
 
 dotenv.config()
 
@@ -35,14 +35,22 @@ app.use(express.json())
 let heliaNode, libp2pNode, bitswap, ipfsOrdersCID = null, ordersCache = []
 
 function encryptOrder(order, secret) {
-  const cipher = crypto.createCipheriv('aes-256-ctr', Buffer.from(secret, 'utf8'), Buffer.alloc(16, 0))
+  const cipher = crypto.createCipheriv(
+    'aes-256-ctr',
+    Buffer.from(secret, 'utf8'),
+    Buffer.alloc(16, 0)
+  )
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()])
   return encrypted.toString('hex')
 }
 
 function decryptOrder(encryptedHex, secret) {
   const encrypted = Buffer.from(encryptedHex, 'hex')
-  const decipher = crypto.createDecipheriv('aes-256-ctr', Buffer.from(secret, 'utf8'), Buffer.alloc(16, 0))
+  const decipher = crypto.createDecipheriv(
+    'aes-256-ctr',
+    Buffer.from(secret, 'utf8'),
+    Buffer.alloc(16, 0)
+  )
   const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
   return JSON.parse(decrypted.toString())
 }
@@ -74,7 +82,7 @@ async function startNode() {
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
-  // Patch logger to add forComponent method if missing (required by bitswap)
+  // Patch logger if missing forComponent method (required by bitswap)
   if (typeof libp2pLogger.forComponent !== 'function') {
     libp2pLogger.forComponent = () => libp2pLogger
   }
@@ -86,12 +94,17 @@ async function startNode() {
   })
 
   heliaNode = await createHelia({ libp2p: libp2pNode, blockstore, bitswap })
+
+  // *** HERE: Manually assign delegatedRouting as heliaNode.contentRouting ***
+  heliaNode.contentRouting = delegatedRouting
+
   console.log('✅ Helia node started — routing:', !!heliaNode.contentRouting)
 
   const seenHashes = new Set()
 
-  // Subscribe to pubsub topic 'orders'
+  // Subscribe to 'orders' pubsub topic
   await libp2pNode.services.pubsub.subscribe('orders')
+
   libp2pNode.services.pubsub.addEventListener('message', async (evt) => {
     try {
       const dataStr = new TextDecoder().decode(evt.detail.data)
