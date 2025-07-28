@@ -12,17 +12,18 @@ import { identify } from '@libp2p/identify'
 import { ping } from '@libp2p/ping'
 import { kadDHT } from '@libp2p/kad-dht'
 import { mdns } from '@libp2p/mdns'
-import { gossipsub } from '@chainsafe/libp2p-gossipsub'
+import { gossipsub } from '@chainsafe/libp2p-gossipsub'  // Correct package name
 
 import { multiaddr } from '@multiformats/multiaddr'
-import { LevelBlockstore } from 'blockstore-level'
-import { createHelia } from 'helia'
-import { createBitswap } from '@helia/bitswap'
-
 import { CID } from 'multiformats/cid'
 import { encode, decode } from 'multiformats/block'
 import * as raw from 'multiformats/codecs/raw'
 import { sha256 } from 'multiformats/hashes/sha2'
+
+import { Level } from 'level'
+import { LevelBlockstore } from 'blockstore-level'
+import { createHelia } from 'helia'
+import { createBitswap } from '@helia/bitswap'
 
 dotenv.config()
 
@@ -35,314 +36,445 @@ const ENCRYPTION_KEY = ENCRYPTION_SECRET
 const PROTOCOL = '/orders/1.0.0'
 const FLASH_PROTOCOL = '/orders/flash/1.0.0'
 const DARKPOOL_SUBSCRIPTIONS_PROTOCOL = '/darkpool/subscriptions/1.0.0'
-
-const DARKPOOL_ANNOUNCE_TOPIC = 'darkpool/announce'
-
-// Inactivity duration (ms) after which a pool is pruned if no new orders/activity
-const POOL_INACTIVITY_PRUNE_MS = 1000 * 60 * 15 // e.g., 15 minutes
-
+const DARKPOOL_ANNOUNCE_TOPIC = 'darkpool:announce'
+const POOL_INACTIVITY_MS = 15 * 60 * 1000
 const app = express()
 app.use(express.json())
 
+const levelDB = new Level('./blockstore')
+const blockstore = new LevelBlockstore(levelDB)
+
+// Globals
 let libp2pNode
-let heliaNode
+let helia
 let bitswap
-let ipfsOrdersCID = null
+let ipfsCID = null
 let ordersCache = []
 
 const darkPools = {}
 const knownPools = new Set()
+const poolActivity = new Map()
+const flashStreams = new Map()
 
-const poolLastActivity = new Map() // poolName -> timestamp of last activity
-
-const flashChannelStreams = new Map()
-
-// Helper: Generate consistent order ID and timestamp
 function generateOrderID(prefix = '') {
-  // UTC timestamp in milliseconds + short random suffix (base36)
   return `${prefix}${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
 }
 
-/**
- * Update last activity timestamp for a pool
- * @param {string} poolName
- */
-function updatePoolActivity(poolName) {
-  if (!poolName) return
-  poolLastActivity.set(poolName, Date.now())
+function updatePoolActivity(pool) {
+  if (pool) poolActivity.set(pool, Date.now())
 }
 
 function encryptOrder(order, key) {
   const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
-  const encrypted = Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()])
-  return encrypted.toString('hex')
+  return Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()]).toString('hex')
 }
 
-function decryptOrder(encryptedHex, key) {
-  const encrypted = Buffer.from(encryptedHex, 'hex')
+function decryptOrder(encrypted, key) {
+  const data = Buffer.from(encrypted, 'hex')
   const decipher = crypto.createDecipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
-  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
-  return JSON.parse(decrypted.toString())
+  return JSON.parse(decipher.update(data).toString() + decipher.final().toString())
 }
 
-function isPeerAuthorizedForPool(peerIdStr, poolName) {
-  if (!darkPools[poolName]) return false
-  return darkPools[poolName].has(peerIdStr)
+function isPeerAuthorized(peerId, pool) {
+  return darkPools[pool]?.has(peerId)
 }
+
+/** Protocol Handlers **/
 
 async function onOrdersProtocol({ stream, connection }) {
   return new Promise((resolve) => {
-    const parser = new JSONParser()
     let order = null
-
+    const parser = new JSONParser()
     parser.onValue = function (value) {
       if (this.stack.length === 0) order = value
     }
-    parser.onError = function (err) {
-      console.error('JSON parse error in orders stream:', err)
-      resolve()
-    }
-
+    parser.onError = () => resolve()
     ;(async () => {
       try {
         for await (const chunk of stream.source) {
-          let bufferToParse = typeof chunk.slice === 'function' ? chunk.slice() : chunk
-          parser.write(Buffer.from(bufferToParse))
+          const buf = typeof chunk.slice === 'function' ? chunk.slice() : chunk
+          parser.write(Buffer.from(buf))
         }
-      } catch (err) {
-        console.error('Error reading orders stream:', err)
-      } finally {
-        try {
-          if (order) {
-            let decryptedOrder = order
-            if (ENCRYPTION_KEY) {
-              try {
-                if (typeof order === 'string') {
-                  decryptedOrder = decryptOrder(order, ENCRYPTION_KEY)
-                } else if (order.encrypted && typeof order.data === 'string') {
-                  decryptedOrder = decryptOrder(order.data, ENCRYPTION_KEY)
-                }
-              } catch {}
-            }
-            const hash = JSON.stringify(decryptedOrder)
-            if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
-              ordersCache.push(decryptedOrder)
-              console.log('📦 Received order via protocol:', decryptedOrder)
-
-              // Update pool activity timestamp if available
-              if (decryptedOrder.pool) updatePoolActivity(decryptedOrder.pool)
-
-              notifyFlashChannels(decryptedOrder)
+      } catch {
+        // ignore
+      }
+      try {
+        if (order) {
+          let decoded = order
+          if (ENCRYPTION_KEY) {
+            try {
+              if (typeof order === 'string') {
+                decoded = decryptOrder(order, ENCRYPTION_KEY)
+              } else if (order.encrypted && typeof order.data === 'string') {
+                decoded = decryptOrder(order.data, ENCRYPTION_KEY)
+              }
+            } catch {
+              // ignore decrypt failures
             }
           }
-        } catch (finalErr) {
-          console.error('Error processing parsed order:', finalErr)
+          const hash = JSON.stringify(decoded)
+          if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
+            ordersCache.push(decoded)
+            console.log('📦 Received order via protocol:', decoded)
+            if (decoded.pool) updatePoolActivity(decoded.pool)
+            notifyFlashStreams(decoded)
+          }
         }
+      } finally {
         resolve()
       }
     })()
   })
 }
 
-async function notifyFlashChannels(order) {
+async function notifyFlashStreams(order) {
   const encoded = new TextEncoder().encode(JSON.stringify(order))
-  for (const [peerId, stream] of flashChannelStreams.entries()) {
+  for (const [peerId, stream] of flashStreams.entries()) {
     try {
-      if (stream && typeof stream.sink === 'function') {
-        await pipe([encoded], stream.sink)
-        console.log(`⚡ Sent flash notification to peer ${peerId}`)
-      }
+      await pipe([encoded], stream.sink)
+      console.log(`⚡ Sent flash notification to peer ${peerId}`)
     } catch (err) {
-      console.warn(`Failed to notify flash channel peer ${peerId}:`, err)
+      console.warn(`Failed flash notify to peer ${peerId}:`, err)
     }
   }
 }
 
-async function onFlashChannel({ stream, connection }) {
-  const peerIdStr = connection.remotePeer.toString()
-  console.log(`⚡ Flash channel stream opened from peer ${peerIdStr}`)
-  flashChannelStreams.set(peerIdStr, stream)
+async function onFlashProtocol({ stream, connection }) {
+  const peerId = connection.remotePeer.toString()
+  flashStreams.set(peerId, stream)
+  console.log(`⚡ Flash protocol connection opened: ${peerId}`)
 
-  const heartbeatIntervalMs = 30000
-
-  async function sendHeartbeat() {
-    if (stream && typeof stream.sink === 'function') {
-      try {
-        await pipe([new TextEncoder().encode(JSON.stringify({ type: 'heartbeat' }))], stream.sink)
-      } catch (err) {
-        console.error(`Heartbeat send error to peer ${peerIdStr}:`, err)
-      }
+  const interval = setInterval(async () => {
+    try {
+      await pipe([new TextEncoder().encode(JSON.stringify({ type: 'heartbeat' }))], stream.sink)
+    } catch {
+      // ignore heartbeat send errors
     }
-  }
-  const interval = setInterval(sendHeartbeat, heartbeatIntervalMs)
+  }, 30000)
 
   try {
     for await (const msg of stream.source) {
-      let bytes
-      if (msg && typeof msg.subarray === 'function') {
-        bytes = msg.subarray()
-      } else if (msg instanceof Uint8Array) {
-        bytes = msg
-      } else {
-        console.warn('⚠️ Received unexpected flash channel message format:', msg)
-        continue
-      }
+      const bytes = typeof msg.subarray === 'function' ? msg.subarray() : msg
+      if (!(bytes instanceof Uint8Array)) continue
       const decoded = new TextDecoder().decode(bytes)
-      console.log(`⚡ Flash channel message received from ${peerIdStr}:`, decoded)
+      console.log(`⚡ Flash message from ${peerId}:`, decoded)
     }
-  } catch (err) {
-    console.error('Flash channel error:', err)
+  } catch {
+    // ignore
   } finally {
     clearInterval(interval)
-    flashChannelStreams.delete(peerIdStr)
-    console.log(`⚡ Flash channel stream closed for peer ${peerIdStr}`)
-  }
-}
-
-async function ensureDarkPoolSubscription(poolName) {
-  if (!poolName) return
-  knownPools.add(poolName)
-  const topic = `darkpool/${poolName}`
-  const subscribedTopics = libp2pNode.services.pubsub.getTopics()
-  if (!subscribedTopics.includes(topic)) {
-    try {
-      await libp2pNode.services.pubsub.subscribe(topic)
-      console.log(`✅ Subscribed to dark pool topic: ${topic}`)
-    } catch (err) {
-      console.warn(`⚠️ Failed to subscribe to dark pool topic ${topic}:`, err)
-    }
-  }
-}
-
-async function announceKnownPools() {
-  try {
-    const poolsArray = Array.from(knownPools)
-    if (poolsArray.length === 0) return
-    const announcement = JSON.stringify({ pools: poolsArray })
-    await libp2pNode.services.pubsub.publish(DARKPOOL_ANNOUNCE_TOPIC, new TextEncoder().encode(announcement))
-    console.log(`📡 Announced known dark pools: ${poolsArray.join(', ')}`)
-  } catch (err) {
-    if (err.code !== 'ERR_NO_PEERS' && err.message !== 'PublishError.NoPeersSubscribedToTopic') {
-      console.warn('Failed to announce dark pools:', err)
-    } else {
-      console.log('No peers subscribed to darkpool announce topic yet; announcement deferred.')
-    }
-  }
-}
-
-async function handleDarkPoolAnnouncement(msg) {
-  try {
-    const decoded = new TextDecoder().decode(msg.detail.data)
-    const obj = JSON.parse(decoded)
-    if (obj?.pools && Array.isArray(obj.pools)) {
-      for (const poolName of obj.pools) {
-        if (!knownPools.has(poolName)) {
-          console.log(`🌐 Learned about new dark pool from announcement: ${poolName}`)
-          knownPools.add(poolName)
-          await ensureDarkPoolSubscription(poolName)
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Error handling dark pool announcement:', err)
+    flashStreams.delete(peerId)
+    console.log(`⚡ Flash protocol connection closed: ${peerId}`)
   }
 }
 
 async function onDarkPoolSubscriptionsProtocol({ stream, connection }) {
-  const peerIdStr = connection.remotePeer.toString()
+  const peerId = connection.remotePeer.toString()
   try {
-    const pools = Array.from(knownPools)
-    const msgStr = JSON.stringify({ pools })
-    await pipe([Buffer.from(msgStr)], stream.sink)
+    const known = Array.from(knownPools)
+    const msg = JSON.stringify({ pools: known })
+    await pipe([Buffer.from(msg)], stream.sink)
 
     for await (const data of stream.source) {
-      const received = data instanceof Uint8Array ? new TextDecoder().decode(data) : data.toString()
-      const obj = JSON.parse(received)
-      if (obj?.pools && Array.isArray(obj.pools)) {
-        for (const poolName of obj.pools) {
-          if (!knownPools.has(poolName)) {
-            console.log(`🌐 Learned about new dark pool from peer ${peerIdStr}: ${poolName}`)
-            knownPools.add(poolName)
-            await ensureDarkPoolSubscription(poolName)
+      const str = data instanceof Uint8Array ? new TextDecoder().decode(data) : data.toString()
+      const obj = JSON.parse(str)
+      if (obj?.pools instanceof Array) {
+        for (const pool of obj.pools) {
+          if (!knownPools.has(pool)) {
+            knownPools.add(pool)
+            await ensurePoolSubscription(pool)
+            console.log(`🌐 Learned new pool ${pool} from peer ${peerId}`)
           }
         }
       }
     }
   } catch (err) {
-    console.error(`Error on dark pool subscriptions protocol with ${peerIdStr}:`, err)
+    console.error('DarkPool subscription protocol error:', err)
   } finally {
-    stream.close && await stream.close().catch(() => {})
+    if (stream.close) await stream.close()
   }
 }
 
-/**
- * Background task to prune pools with no activity beyond threshold and unsubscribe them.
- */
-async function pruneInactivePools() {
-  const now = Date.now()
-  for (const [poolName, lastActive] of poolLastActivity.entries()) {
-    if (now - lastActive > POOL_INACTIVITY_PRUNE_MS) {
-      console.log(`🗑️ Pruning inactive pool: ${poolName}`)
-      poolLastActivity.delete(poolName)
-      knownPools.delete(poolName)
-      if (darkPools[poolName]) {
-        darkPools[poolName].clear()
-        delete darkPools[poolName]
-      }
-      // Unsubscribe pubsub topic if subscribed
-      const topic = `darkpool/${poolName}`
-      const subscribedTopics = libp2pNode.services.pubsub.getTopics()
-      if (subscribedTopics.includes(topic)) {
-        try {
-          await libp2pNode.services.pubsub.unsubscribe(topic)
-          console.log(`✅ Unsubscribed from pruned dark pool topic: ${topic}`)
-        } catch (err) {
-          console.warn(`⚠️ Failed to unsubscribe from pruned dark pool ${topic}:`, err)
+async function ensurePoolSubscription(pool) {
+  if (!pool || !libp2pNode || knownPools.has(pool)) return
+  knownPools.add(pool)
+  const topic = `darkpool/${pool}`
+  if (!libp2pNode.services.pubsub.getTopics().includes(topic)) {
+    try {
+      await libp2pNode.services.pubsub.subscribe(topic)
+      console.log(`✅ Subscribed to ${topic}`)
+    } catch (err) {
+      console.warn(`Subscription failed for ${topic}:`, err)
+    }
+  }
+}
+
+async function announcePools() {
+  if (!libp2pNode || knownPools.size === 0) return
+  try {
+    const announcement = JSON.stringify({ pools: Array.from(knownPools) })
+    await libp2pNode.services.pubsub.publish(DARKPOOL_ANNOUNCE_TOPIC, new TextEncoder().encode(announcement))
+    console.log(`📢 Announced pools: ${Array.from(knownPools).join(', ')}`)
+  } catch (err) {
+    if (!String(err).includes('NoPeers')) {
+      console.warn('Announce pools error:', err)
+    }
+  }
+}
+
+async function handleAnnouncement(evt) {
+  if (evt.topic !== DARKPOOL_ANNOUNCE_TOPIC) return
+  try {
+    const msg = new TextDecoder().decode(evt.detail.data)
+    const obj = JSON.parse(msg)
+    if (obj?.pools instanceof Array) {
+      for (const pool of obj.pools) {
+        if (!knownPools.has(pool)) {
+          knownPools.add(pool)
+          await ensurePoolSubscription(pool)
+          console.log(`🌐 Learned new pool ${pool} from announcement`)
         }
       }
-      // Announce updated pools list after pruning
-      await announceKnownPools()
+    }
+  } catch (err) {
+    console.error('Handle announcement failed:', err)
+  }
+}
+
+function prunePools() {
+  const now = Date.now()
+  for (const [pool, lastActive] of poolActivity.entries()) {
+    if (now - lastActive > POOL_INACTIVITY_MS) {
+      console.log(`🗑️ Pruning inactive pool ${pool}`)
+      poolActivity.delete(pool)
+      knownPools.delete(pool)
+      if (darkPools[pool]) {
+        delete darkPools[pool]
+      }
+      if (!libp2pNode) return
+      const topic = `darkpool/${pool}`
+      if (libp2pNode.services.pubsub.getTopics().includes(topic)) {
+        libp2pNode.services.pubsub.unsubscribe(topic).catch(() => {})
+        announcePools().catch(() => {})
+        console.log(`Unsubscribed and removed inactive pool ${pool}`)
+      }
     }
   }
 }
 
-// Periodically prune inactive pools (every 10 minutes)
 setInterval(() => {
-  if (libp2pNode && libp2pNode.isStarted) {
-    pruneInactivePools().catch(err => {
-      console.warn('Error pruning inactive pools:', err)
-    })
-  }
-}, 1000 * 60 * 10) // 10 minutes interval
+  if (libp2pNode?.isStarted) prunePools()
+}, 10 * 60 * 1000)
 
-async function connectToPeer(multiaddrStr) {
+// Dial helper with protocol specified
+
+async function connectPeer(addrStr) {
+  if (!libp2pNode) throw new Error('libp2p not started')
   try {
-    let maddr = multiaddr(multiaddrStr)
-    if (!maddr.getPeerId()) {
-      const peerIdStr = multiaddrStr.split('/p2p/')[1]
-      if (peerIdStr) maddr = maddr.encapsulate(`/p2p/${peerIdStr}`)
+    let addr = multiaddr(addrStr)
+    if (!addr.getPeerId()) {
+      const pid = addrStr.split('/p2p/')[1]
+      if (pid) addr = addr.encapsulate(`/p2p/${pid}`)
     }
-    if (maddr.getPeerId() === libp2pNode.peerId.toString()) {
-      throw new Error('Cannot dial self peer ID')
+    if (addr.getPeerId().toString() === libp2pNode.peerId.toString()) {
+      throw new Error('Cannot dial self')
     }
-    console.log(`Dialing peer at: ${maddr.toString()}`)
-    const conn = await libp2pNode.dial(maddr)
-    console.log('Connection established:', conn.remoteAddr.toString())
-    try {
-      const { stream } = await conn.newStream([DARKPOOL_SUBSCRIPTIONS_PROTOCOL])
-      stream.close && stream.close().catch(() => {})
-    } catch (err) {
-      console.warn('Warning: failed to open darkpool subscriptions protocol stream:', err.message)
-    }
+    console.log(`Dialing ${addr.toString()}`)
+    const conn = await libp2pNode.dialProtocol(addr, PROTOCOL)
+    if (conn.stream && conn.stream.close) await conn.stream.close()
+    console.log(`Connected to ${addr.toString()}`)
     return true
   } catch (err) {
-    console.error('Failed to dial peer:', err)
-    throw new Error(`Failed to connect: ${err.message}`)
+    console.error('Dial error:', err)
+    throw err
   }
 }
 
+async function syncOrders(orders, pool) {
+  let data = orders
+  if (pool && ENCRYPTION_KEY) {
+    data = orders.map(o => ({
+      encrypted: true,
+      data: encryptOrder(o, ENCRYPTION_KEY),
+      pool
+    }))
+  }
+  const encoded = new TextEncoder().encode(JSON.stringify(data))
+  const block = await encode({ value: encoded, codec: raw, hasher: sha256 })
+  await blockstore.put(block.cid, block.bytes)
+  ipfsCID = block.cid.toString()
+  ordersCache = data
+  if (pool) updatePoolActivity(pool)
+  try {
+    if (helia.contentRouting?.provide) {
+      await helia.contentRouting.provide(block.cid)
+      console.log(`🔗 Provided CID ${block.cid.toString()}`)
+    }
+  } catch {}
+  await ensurePoolSubscription(pool)
+  try {
+    await libp2pNode.services.pubsub.publish(pool ? `darkpool/${pool}` : 'orders', encoded)
+    console.log(`Published orders to ${pool ?? 'orders'}`)
+  } catch {}
+  await announcePools()
+  return ipfsCID
+}
+
+async function broadcastOrder(order, pool) {
+  if (!order || typeof order !== 'object') throw new Error('Order must be an object')
+  if (order.encrypted && typeof order !== 'object') throw new Error('Encrypted order must be a string')
+
+  if (!order.id) order.id = generateOrderID('privateOrder-')
+  if (!order.submitted) order.submitted = Date.now()
+  if (pool) updatePoolActivity(pool)
+
+  let payload = pool && ENCRYPTION_KEY ? encryptOrder(order, ENCRYPTION_KEY) : JSON.stringify(order)
+
+  const topic = pool ? `darkpool/${pool}` : 'orders'
+  await ensurePoolSubscription(pool)
+
+  const encoded = new TextEncoder().encode(payload)
+  try {
+    await libp2pNode.services.pubsub.publish(topic, encoded)
+    console.log(`Published single order to ${topic}`)
+  } catch (err) {
+    if (!String(err).includes('NoPeers')) {
+      throw err
+    }
+  }
+
+  for (const peerId of libp2pNode.getPeers()) {
+    try {
+      const { stream } = await libp2pNode.dialProtocol(peerId, PROTOCOL)
+      await pipe([encoded], stream.sink)
+      stream.close?.()
+      console.log(`Sent order to ${peerId.toString()}`)
+    } catch (err) {
+      console.warn(`Failed to send order to ${peerId.toString()}:`, err)
+    }
+  }
+}
+
+// Express Routes
+
+app.post('/api/subscribe', async (req, res) => {
+  const { topic } = req.body
+  if (!topic || typeof topic !== 'string')
+    return res.status(400).json({ error: 'Invalid topic' })
+  try {
+    await libp2pNode.services.pubsub.subscribe(topic)
+    console.log(`✅ Subscribed to ${topic}`)
+    res.json({ success: true, topic })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/subscriptions', (req, res) => {
+  if (!libp2pNode) return res.json({ subscriptions: [] })
+  try {
+    res.json({ subscriptions: libp2pNode.services.pubsub.getTopics() })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/orders', async (req, res) => {
+  const pool = req.query.pool ?? null
+  if (!ipfsCID) return res.json(ordersCache)
+  try {
+    const cid = CID.parse(ipfsCID)
+    const bytes = await blockstore.get(cid)
+    const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
+    const data = JSON.parse(new TextDecoder().decode(block.value))
+    res.json(pool ? data.filter(o => o.pool === pool) : data)
+  } catch {
+    res.json(ordersCache)
+  }
+})
+
+app.post('/api/orders', async (req, res) => {
+  try {
+    let { order, orders, pool } = req.body
+    if (order && ENCRYPTION_KEY && typeof order === 'string') {
+      order = decryptOrder(order, ENCRYPTION_KEY)
+    }
+    if (!order && !orders) return res.status(400).json({ error: 'Missing order(s)' })
+    if (order && typeof order !== 'object') return res.status(400).json({ error: 'Order must be an object' })
+
+    if (order) {
+      if (!order.id) order.id = generateOrderID('privateOrder-')
+      if (!order.submitted) order.submitted = Date.now()
+    }
+    if (pool) {
+      if (!darkPools[pool]) {
+        darkPools[pool] = new Set()
+        knownPools.add(pool)
+      }
+      if (libp2pNode) darkPools[pool].add(libp2pNode.peerId.toString())
+    }
+    if (orders) {
+      const cid = await syncOrders(orders, pool)
+      await announcePools()
+      return res.json({ success: true, cid })
+    }
+    if (order) {
+      await broadcastOrder(order, pool)
+      await announcePools()
+      return res.json({ success: true, order })
+    }
+    res.status(400).json({ error: 'No valid order or orders provided' })
+  } catch (err) {
+    console.error('Order post error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/connect', async (req, res) => {
+  const { multiaddr: addr } = req.body
+  if (!addr) return res.status(400).json({ error: 'Missing multiaddr' })
+  try {
+    await connectPeer(addr)
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Graceful shutdown
+
+process.on('SIGINT', async () => {
+  try {
+    await libp2pNode?.stop()
+    console.log('Libp2p stopped gracefully')
+    process.exit(0)
+  } catch {
+    process.exit(1)
+  }
+})
+
+// Global error handler
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err)
+  res.status(err.status || 500).json({ status: 'error', message: err.message || 'Internal Server Error' })
+})
+
+// Server startup
+
+app.listen(PORT, async () => {
+  console.log(`🚀 Backend starting at http://localhost:${PORT}`)
+  await startNode()
+  console.log(`✅ libp2p started with peerId: ${libp2pNode?.peerId.toString()}`)
+  console.log(`✅ Helia routing assigned: ${!!helia?.contentRouting}`)
+  console.log(`✅ Subscribed to 'orders' topic`)
+  console.log('Backend ready to accept requests')
+})
+
+// Logger singleton
+
 const mockLogger = {
-  forComponent: (name) => ({
+  forComponent: name => ({
     debug: (...args) => console.debug(`[${name}][DEBUG]`, ...args),
     info: (...args) => console.info(`[${name}][INFO]`, ...args),
     warn: (...args) => console.warn(`[${name}][WARN]`, ...args),
@@ -350,36 +482,15 @@ const mockLogger = {
   }),
 }
 
-app.post('/api/subscribe', async (req, res) => {
-  const { topic } = req.body
-  if (!topic || typeof topic !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid topic' })
-  }
-  try {
-    await libp2pNode.services.pubsub.subscribe(topic)
-    console.log(`✅ Subscribed to topic ${topic} via API request`)
-    res.json({ success: true, topic })
-  } catch (err) {
-    console.error('Failed to subscribe via API:', err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.get('/api/subscriptions', (_req, res) => {
-  try {
-    const topics = libp2pNode.services.pubsub.getTopics()
-    res.json({ subscribedTopics: topics })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
+// Start libp2p and supporting nodes
 
 async function startNode() {
   libp2pNode = await createLibp2p({
     addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
     transports: [tcp()],
-    connectionEncrypters: [noise()],
     streamMuxers: [mplex()],
+    connectionEncryption: [noise()],
+    connectionManager: { minConnections: 1, maxConnections: 10, autoDial: false },
     services: {
       identify: identify(),
       ping: ping(),
@@ -387,24 +498,20 @@ async function startNode() {
         allowPublishToZeroPeers: true,
         emitSelf: false,
       }),
-      mdns: mdns({ interval: 10000, compat: true }),
+      mdns: mdns({ interval: 10_000, compat: true }),
       dht: kadDHT({
         enabled: true,
         clientMode: false,
         randomWalk: { enabled: true },
       }),
     },
-    connectionManager: {
-      minConnections: 1,
-      maxConnections: 10,
-      autoDial: false,
-    },
   })
 
-  await libp2pNode.services?.dht?.start()
+  await libp2pNode.start()
+  await libp2pNode.services.dht.start()
 
   libp2pNode.handle(PROTOCOL, onOrdersProtocol)
-  libp2pNode.handle(FLASH_PROTOCOL, onFlashChannel)
+  libp2pNode.handle(FLASH_PROTOCOL, onFlashProtocol)
   libp2pNode.handle(DARKPOOL_SUBSCRIPTIONS_PROTOCOL, onDarkPoolSubscriptionsProtocol)
 
   libp2pNode.addEventListener('listening', () => {
@@ -412,55 +519,42 @@ async function startNode() {
     libp2pNode.getMultiaddrs().forEach(addr => console.log(addr.toString()))
   })
 
-  libp2pNode.addEventListener('peer:discovery', async (evt) => {
-    const peerId = evt.detail.id.toString()
-    console.log('Discovered peer:', peerId)
+  libp2pNode.addEventListener('peer:discovery', async evt => {
+    const pid = evt.detail.id.toString()
+    console.log(`Discovered peer ${pid}`)
+    if (pid === libp2pNode.peerId.toString()) return
     try {
       const peerInfo = await libp2pNode.peerStore.get(evt.detail.id)
-      if (peerInfo.addresses.length > 0) {
-        let authorized = false
-        for (const poolName of Object.keys(darkPools)) {
-          if (isPeerAuthorizedForPool(peerId, poolName)) {
-            authorized = true
-            break
-          }
-        }
-        if (!authorized) {
-          authorized = true
-        }
-        if (authorized) {
-          const addrWithPeer = peerInfo.addresses[0].multiaddr.encapsulate(`/p2p/${peerId}`)
-          console.log(`Attempting to connect to peer at: ${addrWithPeer}`)
-          try {
-            await libp2pNode.dial(addrWithPeer)
-            console.log('✅ Successfully connected to discovered peer')
-          } catch (err) {
-            console.error('Failed to connect to discovered peer:', err)
-          }
-        } else {
-          console.log(`Peer ${peerId} not authorized in dark pools; skipping dial`)
+      if (!peerInfo) return
+      const allowed = Object.keys(darkPools).some(pool => isPeerAuthorized(pid, pool)) || true
+      if (!allowed) {
+        console.log(`Peer ${pid} not authorized; skipping dial`)
+        return
+      }
+      for (const addr of peerInfo.addresses) {
+        try {
+          const dialAddr = addr.multiaddr.encapsulate(`/p2p/${pid}`)
+          console.log(`Dialing discovered peer at ${dialAddr}`)
+          await libp2pNode.dialProtocol(dialAddr, PROTOCOL)
+          console.log(`✅ Connected to peer ${pid}`)
+          break
+        } catch {
+          // ignore dial failures
         }
       }
     } catch (err) {
-      console.error('Error retrieving peer info:', err)
+      console.error('Discovery error', err)
     }
   })
 
-  libp2pNode.addEventListener('peer:connect', async (evt) => {
-    console.log('✅ Connected to peer:', evt.detail.toString())
-    try {
-      await announceKnownPools()
-    } catch { }
+  libp2pNode.addEventListener('peer:connect', evt => {
+    console.log(`✅ Connected to peer ${evt.detail.toString()}`)
+    announcePools().catch(() => {})
   })
 
-  libp2pNode.addEventListener('peer:disconnect', (evt) => {
-    console.log('🚫 Disconnected from peer:', evt.detail.toString())
+  libp2pNode.addEventListener('peer:disconnect', evt => {
+    console.log(`❌ Disconnected from peer ${evt.detail.toString()}`)
   })
-
-  await libp2pNode.start()
-  console.log('✅ libp2p started with peerId:', libp2pNode.peerId.toString())
-
-  const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
   bitswap = await createBitswap({
     libp2p: libp2pNode,
@@ -468,274 +562,56 @@ async function startNode() {
     logger: mockLogger,
   })
 
-  heliaNode = await createHelia({
+  helia = await createHelia({
     libp2p: libp2pNode,
     blockstore,
     bitswap,
   })
 
-  if (libp2pNode.services?.dht) {
-    heliaNode.contentRouting = libp2pNode.services.dht
-    console.log('✅ Helia content routing assigned from libp2p KadDHT')
+  if (libp2pNode.services.dht) {
+    helia.contentRouting = libp2pNode.services.dht
+    console.log('✅ Helia content routing enabled')
   } else {
-    console.warn('⚠️ Could not assign content routing to Helia (DHT missing)')
+    console.warn('⚠️ Helia content routing not available')
   }
 
   await libp2pNode.services.pubsub.subscribe('orders')
-  console.log('✅ Subscribed to public "orders" topic')
+  console.log('✅ Subscribed to "orders" topic')
 
-  for (const poolName of Object.keys(darkPools)) {
-    await ensureDarkPoolSubscription(poolName)
+  for (const pool of Object.keys(darkPools)) {
+    await ensurePoolSubscription(pool)
   }
 
   await libp2pNode.services.pubsub.subscribe(DARKPOOL_ANNOUNCE_TOPIC)
-  libp2pNode.services.pubsub.addEventListener('message', async (evt) => {
-    if (evt.detail.topic === DARKPOOL_ANNOUNCE_TOPIC) {
-      await handleDarkPoolAnnouncement(evt)
+  libp2pNode.services.pubsub.addEventListener('message', async evt => {
+    if (evt.topic === DARKPOOL_ANNOUNCE_TOPIC) {
+      await handleAnnouncement(evt)
       return
     }
-
     try {
-      const dataStr = new TextDecoder().decode(evt.detail.data)
-      let order
+      const txt = new TextDecoder().decode(evt.detail.data)
+      let payload
       if (ENCRYPTION_KEY) {
         try {
-          order = decryptOrder(dataStr, ENCRYPTION_KEY)
+          payload = decryptOrder(txt, ENCRYPTION_KEY)
         } catch {
-          order = JSON.parse(dataStr)
+          payload = JSON.parse(txt)
         }
       } else {
-        order = JSON.parse(dataStr)
+        payload = JSON.parse(txt)
       }
-      const hash = JSON.stringify(order)
-      if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
-        ordersCache.push(order)
-        console.log('📦 Received order via pubsub:', order)
-        notifyFlashChannels(order)
-        if (order.pool) updatePoolActivity(order.pool)
+      const h = JSON.stringify(payload)
+      if (!ordersCache.some(o => JSON.stringify(o) === h)) {
+        ordersCache.push(payload)
+        notifyFlashStreams(payload)
+        if (payload.pool) updatePoolActivity(payload.pool)
+        console.log('📦 New order via pubsub:', payload)
       }
-    } catch (err) {
-      console.error('PubSub message error:', err)
+    } catch {
+      // ignore message errors
     }
   })
 
-  setTimeout(() => {
-    announceKnownPools().catch(() => { })
-  }, 5000)
+  // Announce initial pools shortly after start
+  setTimeout(() => announcePools().catch(() => {}), 5000)
 }
-
-async function syncOrdersToIPFS(orders, poolName = null) {
-  let ordersToStore = orders
-  if (poolName && ENCRYPTION_KEY) {
-    ordersToStore = orders.map(order => ({
-      encrypted: true,
-      data: encryptOrder(order, ENCRYPTION_KEY),
-      pool: poolName,
-    }))
-  }
-
-  const encoded = new TextEncoder().encode(JSON.stringify(ordersToStore))
-  const block = await encode({ value: encoded, codec: raw, hasher: sha256 })
-  await heliaNode.blockstore.put(block.cid, block.bytes)
-  ipfsOrdersCID = block.cid.toString()
-  ordersCache = ordersToStore
-
-  if (poolName) updatePoolActivity(poolName)
-
-  try {
-    if (heliaNode.contentRouting?.provide) {
-      await heliaNode.contentRouting.provide(block.cid)
-      console.log('📡 CID provided to network:', block.cid.toString())
-    } else {
-      console.warn('⚠️ Content routing not available')
-    }
-  } catch (err) {
-    console.warn('CID provide error:', err)
-  }
-
-  const topic = poolName ? `darkpool/${poolName}` : 'orders'
-
-  if (poolName) {
-    await ensureDarkPoolSubscription(poolName)
-  }
-
-  try {
-    const pubData = new TextEncoder().encode(JSON.stringify(ordersToStore))
-    await libp2pNode.services.pubsub.publish(topic, pubData)
-    console.log(`📢 Published orders to ${topic}`)
-  } catch (err) {
-    console.warn(`Pubsub publish error on topic ${topic}:`, err)
-  }
-
-  await announceKnownPools()
-
-  return ipfsOrdersCID
-}
-
-async function broadcastOrder(order, poolName = null) {
-  if (!order.id) order.id = generateOrderID('privateOrder-')
-  if (!order.submittedAt) order.submittedAt = Date.now()
-  if (poolName) updatePoolActivity(poolName)
-
-  let dataToSend
-  if (poolName && ENCRYPTION_KEY) {
-    dataToSend = encryptOrder(order, ENCRYPTION_KEY)
-  } else {
-    dataToSend = JSON.stringify(order)
-  }
-  const encodedData = new TextEncoder().encode(dataToSend)
-
-  const topic = poolName ? `darkpool/${poolName}` : 'orders'
-
-  if (poolName) {
-    await ensureDarkPoolSubscription(poolName)
-  }
-
-  try {
-    await libp2pNode.services.pubsub.publish(topic, encodedData)
-    console.log(`📢 Published single order to ${topic}`)
-  } catch (err) {
-    if (err.message.includes('NoPeersSubscribedToTopic')) {
-      console.log(`⚠️ No peers subscribed to topic ${topic}, skipping pubsub publish`)
-    } else {
-      console.error('PubSub publish error:', err)
-    }
-  }
-
-  const peers = libp2pNode.getPeers()
-  if (peers.length === 0) {
-    console.log('ℹ️ No peers connected to send order directly')
-    return
-  }
-
-  for (const peerId of peers) {
-    try {
-      const streamOrRes = await libp2pNode.dialProtocol(peerId, PROTOCOL)
-      const stream = streamOrRes?.stream ? streamOrRes.stream : streamOrRes
-      if (!stream) {
-        console.warn(`No stream returned from dialProtocol for peer ${peerId.toString()}, skipping`)
-        continue
-      }
-      if (typeof stream.sink !== 'function') {
-        console.warn(`stream.sink is not a function for peer ${peerId.toString()}, skipping`)
-        continue
-      }
-      await pipe([encodedData], stream.sink)
-      if (stream.close) await stream.close()
-      console.log(`📤 Sent order to ${peerId.toString()}`)
-    } catch (err) {
-      console.error(`Failed to send to peer ${peerId.toString()}:`, err)
-    }
-  }
-}
-
-app.get('/api/peers', (_req, res) => {
-  const peers = Array.from(libp2pNode.getPeers()).map(peerId => peerId.toString())
-  res.json({ peers })
-})
-
-app.get('/api/addresses', (_req, res) => {
-  const addresses = libp2pNode.getMultiaddrs().map(ma => ma.toString())
-  res.json({ addresses })
-})
-
-app.get('/api/orders', async (req, res) => {
-  const poolName = req.query.pool || null
-
-  if (!ipfsOrdersCID) return res.json(ordersCache)
-
-  try {
-    const cid = CID.parse(ipfsOrdersCID)
-    const bytes = await heliaNode.blockstore.get(cid)
-    const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
-    let orders = new TextDecoder().decode(block.value)
-    orders = JSON.parse(orders)
-
-    if (poolName) {
-      orders = orders.filter(o => {
-        if (!o.pool && !poolName) return true
-        return o.pool === poolName
-      })
-    }
-
-    res.json(orders)
-  } catch (err) {
-    console.warn('IPFS read fallback to cache:', err)
-    res.json(ordersCache)
-  }
-})
-
-app.get('/api/orders/:cid', async (req, res) => {
-  const { cid } = req.params
-  try {
-    const parsed = CID.parse(cid)
-    const bytes = await heliaNode.blockstore.get(parsed)
-    const block = await decode({ cid: parsed, bytes, codec: raw, hasher: sha256 })
-    const orders = new TextDecoder().decode(block.value)
-    res.json(JSON.parse(orders))
-  } catch (err) {
-    res.status(500).json({ error: 'Could not retrieve orders for CID', details: err.message })
-  }
-})
-
-app.post('/api/orders', async (req, res) => {
-  try {
-    const { orders, order, poolName } = req.body
-
-    if (poolName && !darkPools[poolName]) {
-      darkPools[poolName] = new Set()
-      knownPools.add(poolName)
-      console.log(`Created new dark pool '${poolName}'`)
-    }
-
-    if (poolName && libp2pNode?.peerId) {
-      darkPools[poolName].add(libp2pNode.peerId.toString())
-      console.log(`Added self to dark pool '${poolName}' whitelist`)
-    }
-
-    if (orders) {
-      const ipfsCid = await syncOrdersToIPFS(orders, poolName)
-      await announceKnownPools()
-      return res.json({ success: true, cid: ipfsCid })
-    }
-    if (order) {
-      await broadcastOrder(order, poolName)
-      await announceKnownPools()
-      return res.json({ success: true, message: `Order broadcasted in ${poolName || 'public'}`, order })
-    }
-    res.status(400).json({ error: 'Missing orders or order' })
-  } catch (err) {
-    console.error('Failed to process orders request:', err)
-    res.status(500).json({ error: 'Internal server error', details: err.message })
-  }
-})
-
-app.post('/api/connect-peer', async (req, res) => {
-  const { multiaddr: multiaddrStr } = req.body
-  if (!multiaddrStr) return res.status(400).json({ error: 'Missing multiaddr' })
-
-  try {
-    await connectToPeer(multiaddrStr)
-    res.json({ success: true, message: 'Connected to peer' })
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to connect to peer', details: err.message })
-  }
-})
-
-process.on('SIGINT', async () => {
-  console.log('\nShutting down...')
-  try {
-    if (libp2pNode) await libp2pNode.stop()
-    console.log('Libp2p stopped')
-    process.exit(0)
-  } catch (err) {
-    console.error('Error shutting down:', err)
-    process.exit(1)
-  }
-})
-
-app.listen(PORT, async () => {
-  console.log(`🚀 Backend starting at http://localhost:${PORT}`)
-  await startNode()
-  console.log('Backend ready to accept requests')
-})

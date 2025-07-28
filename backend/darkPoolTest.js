@@ -7,17 +7,32 @@ const ENCRYPTION_KEY = ENCRYPTION_SECRET
   ? crypto.createHash('sha256').update(ENCRYPTION_SECRET).digest()
   : null
 
-// Encrypt if key present, matching backend AES-256-CTR encryption
+/**
+ * Encrypt the order object with AES-256-CTR using the provided key.
+ * Returns a hex-encoded string of ciphertext.
+ * Must match encryption on backend.
+ */
 function encryptOrder(order, key) {
   const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()])
   return encrypted.toString('hex')
 }
 
-async function postOrderToDarkPool(order, poolName) {
-  const payload = { order, poolName }
+/**
+ * Post a single order to the backend API dark pool endpoint.
+ * If encryption key is set, encrypts the order before sending.
+ * @param {Object} order - Order object
+ * @param {string} pool - Pool name string
+ */
+async function postOrderToDarkPool(order, pool) {
+  const payload = { pool }
+
   if (ENCRYPTION_KEY) {
+    // Encrypt order as hex string
     payload.order = encryptOrder(order, ENCRYPTION_KEY)
+  } else {
+    // Send plain object
+    payload.order = order
   }
 
   const res = await fetch(`${API_BASE}/orders`, {
@@ -30,43 +45,47 @@ async function postOrderToDarkPool(order, poolName) {
   if (!res.ok) {
     throw new Error(`POST /orders failed: ${JSON.stringify(data)}`)
   }
-  console.log(`✅ Order posted to dark pool '${poolName}':`, data)
+  console.log(`✅ Order posted to dark pool '${pool}':`, data)
   return data
 }
 
-async function getOrdersFromDarkPool(poolName) {
-  const res = await fetch(`${API_BASE}/orders?pool=${encodeURIComponent(poolName)}`, {
-    method: 'GET'
-  })
+/**
+ * Fetch orders from the backend API dark pool endpoint.
+ * @param {string} pool - Pool name string
+ */
+async function getOrdersFromDarkPool(pool) {
+  const url = `${API_BASE}/orders?pool=${encodeURIComponent(pool)}`
+  const res = await fetch(url, { method: 'GET' })
 
   if (!res.ok) {
-    const errData = await res.json()
-    throw new Error(`GET /orders (pool=${poolName}) failed: ${JSON.stringify(errData)}`)
+    const errorData = await res.json()
+    throw new Error(`GET /orders (pool=${pool}) failed: ${JSON.stringify(errorData)}`)
   }
 
   const orders = await res.json()
-  console.log(`📝 Orders retrieved from dark pool '${poolName}':`, orders)
+  console.log(`📝 Orders retrieved from dark pool '${pool}':`, orders)
   return orders
 }
 
 async function main() {
   try {
-    const poolName = 'institutional-pool'
+    const pool = 'institutional-pool'
     const timestamp = Date.now()
 
+    // Example test order object
     const testOrder = {
       id: `darkOrder-${timestamp}`,
       item: 'PrivateWidget',
       quantity: 42,
       submittedAt: timestamp,
-      encrypted: !!ENCRYPTION_KEY,
+      encrypted: !!ENCRYPTION_KEY, // Just metadata to indicate encryption status
     }
 
-    console.log(`Posting order to dark pool '${poolName}'...`)
-    await postOrderToDarkPool(testOrder, poolName)
+    console.log(`Posting order to dark pool '${pool}'...`)
+    await postOrderToDarkPool(testOrder, pool)
 
-    console.log(`Fetching orders from dark pool '${poolName}'...`)
-    await getOrdersFromDarkPool(poolName)
+    console.log(`Fetching orders from dark pool '${pool}'...`)
+    await getOrdersFromDarkPool(pool)
 
     console.log('✅ Dark pool test completed successfully.')
   } catch (err) {
