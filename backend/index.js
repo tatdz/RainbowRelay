@@ -3,7 +3,6 @@ import dotenv from 'dotenv'
 import express from 'express'
 import JSONParser from 'jsonparse'
 
-
 import { pipe } from 'it-pipe'
 import { createLibp2p } from 'libp2p'
 import { tcp } from '@libp2p/tcp'
@@ -67,10 +66,8 @@ async function onOrdersProtocol({ stream }) {
   return new Promise((resolve) => {
     const parser = new JSONParser()
     let order = null
-    const chunks = []
 
     parser.onValue = function (value) {
-      // When a full JSON object is parsed at root level:
       if (this.stack.length === 0) {
         order = value
       }
@@ -78,23 +75,17 @@ async function onOrdersProtocol({ stream }) {
 
     parser.onError = function (err) {
       console.error('JSON parse error in streaming protocol:', err)
-      resolve() // end processing on error
+      resolve()
     }
 
-    // Collect chunks and feed parser
     ;(async () => {
       try {
         for await (const chunk of stream.source) {
-          let bufferToParse
-          if (typeof chunk.slice === 'function') {
-            bufferToParse = chunk.slice()
-          } else {
-            bufferToParse = chunk
-          }
+          let bufferToParse = typeof chunk.slice === 'function' ? chunk.slice() : chunk
           parser.write(Buffer.from(bufferToParse))
         }
       } catch (err) {
-        console.error('Error reading stream for protocol:', err)
+        console.error('Error reading stream:', err)
       } finally {
         try {
           if (order) {
@@ -121,7 +112,7 @@ async function onOrdersProtocol({ stream }) {
   })
 }
 
-// Connect to peer by multiaddr string, append peer ID suffix if missing
+// Connect to peer by multiaddr string
 async function connectToPeer(multiaddrStr) {
   try {
     let maddr = multiaddr(multiaddrStr)
@@ -133,7 +124,6 @@ async function connectToPeer(multiaddrStr) {
       }
     }
 
-    // Prevent dialing self
     if (maddr.getPeerId() === libp2pNode.peerId.toString()) {
       throw new Error('Attempted to dial self peer ID, which is not allowed')
     }
@@ -143,11 +133,9 @@ async function connectToPeer(multiaddrStr) {
     const connection = await libp2pNode.dial(maddr)
     console.log('Connection established:', connection.remoteAddr.toString())
 
-    // newStream returns stream directly, do not destructure
     const stream = await connection.newStream([PROTOCOL])
     console.log('Protocol stream opened')
 
-    // Close the stream politely
     if (stream.close) await stream.close()
 
     return true
@@ -157,7 +145,7 @@ async function connectToPeer(multiaddrStr) {
   }
 }
 
-// Bitswap logger for compatibility with libp2p utils
+// Bitswap logger
 const mockLogger = {
   forComponent: (name) => ({
     debug: (...args) => console.debug(`[${name}][DEBUG]`, ...args),
@@ -181,7 +169,13 @@ async function startNode() {
         emitSelf: false,
       }),
       mdns: mdns({ interval: 10000, compat: true }),
-      dht: kadDHT(),
+      dht: kadDHT({
+        enabled: true,
+        clientMode: false,
+        randomWalk: {
+          enabled: true,
+        },
+      }),
     },
     connectionManager: {
       minConnections: 1,
@@ -190,7 +184,14 @@ async function startNode() {
     },
   })
 
-  // Log encryption modules loaded for diagnostic
+  // Start the DHT explicitly for content routing capabilities
+  await libp2pNode.services?.dht?.start()
+
+  // Assign KadDHT from libp2p to helia's contentRouting (this links DHT with Helia)
+  // Note: Helia may or may not set this internally; here we explicitly assign:
+  // This line must be after heliaNode is created later (see change below)
+  // So we'll assign after heliaNode setup in a bit.
+
   const encryptionModules = libp2pNode.connectionEncrypters || []
   console.log('Connection Encryption modules:', encryptionModules.map(p => p.protocol))
 
@@ -231,15 +232,15 @@ async function startNode() {
     }
   })
 
-  libp2pNode.addEventListener('peer:connect', evt => {
+  libp2pNode.addEventListener('peer:connect', (evt) => {
     console.log('✅ Connected to peer:', evt.detail.toString())
   })
 
-  libp2pNode.addEventListener('connection:open', evt => {
+  libp2pNode.addEventListener('connection:open', (evt) => {
     console.log('🔗 Connection opened to:', evt.detail.remotePeer.toString())
   })
 
-  libp2pNode.addEventListener('peer:disconnect', evt => {
+  libp2pNode.addEventListener('peer:disconnect', (evt) => {
     console.log('🚫 Disconnected from peer:', evt.detail.toString())
   })
 
@@ -261,6 +262,14 @@ async function startNode() {
   })
 
   console.log('✅ Helia node started')
+
+  // Now link libp2p KadDHT as Helia contentRouting for provide/find
+  if (libp2pNode.services?.dht) {
+    heliaNode.contentRouting = libp2pNode.services.dht
+    console.log('✅ Helia content routing assigned from libp2p KadDHT')
+  } else {
+    console.warn('⚠️ Could not assign content routing to Helia (DHT missing)')
+  }
 
   await libp2pNode.services.pubsub.subscribe('orders')
   console.log('✅ Subscribed to "orders" topic')
@@ -289,7 +298,7 @@ async function startNode() {
   })
 }
 
-// Sync orders to IPFS via Helia
+// Sync orders to IPFS via Helia and provide on network
 async function syncOrdersToIPFS(orders) {
   const encoded = new TextEncoder().encode(JSON.stringify(orders))
   const block = await encode({ value: encoded, codec: raw, hasher: sha256 })
@@ -310,7 +319,7 @@ async function syncOrdersToIPFS(orders) {
   return ipfsOrdersCID
 }
 
-// Broadcast order to pubsub and peers over protocol with robust checks
+// Broadcast order to pubsub and protocol peers
 async function broadcastOrder(order) {
   let dataToSend
   if (ENCRYPTION_KEY) {
@@ -320,7 +329,6 @@ async function broadcastOrder(order) {
   }
   const encodedData = new TextEncoder().encode(dataToSend)
 
-  // Publish to pubsub topic 'orders'
   try {
     await libp2pNode.services.pubsub.publish('orders', encodedData)
     console.log('📢 Published order to pubsub')
@@ -342,8 +350,6 @@ async function broadcastOrder(order) {
     try {
       const streamOrRes = await libp2pNode.dialProtocol(peerId, PROTOCOL)
       const stream = streamOrRes?.stream ? streamOrRes.stream : streamOrRes
-      console.log(`dialProtocol() returned for peer ${peerId.toString()}:`, stream)
-
       if (!stream) {
         console.warn(`No stream returned from dialProtocol for peer ${peerId.toString()}, skipping`)
         continue
@@ -352,12 +358,8 @@ async function broadcastOrder(order) {
         console.warn(`stream.sink is not a function for peer ${peerId.toString()}, skipping`)
         continue
       }
-
       await pipe([encodedData], stream.sink)
-
-      if (stream.close) {
-        await stream.close()
-      }
+      if (stream.close) await stream.close()
       console.log(`📤 Sent order to ${peerId.toString()}`)
     } catch (err) {
       console.error(`Failed to send to peer ${peerId.toString()}:`, err)
@@ -388,6 +390,20 @@ app.get('/api/orders', async (_req, res) => {
   } catch (err) {
     console.warn('IPFS read fallback to cache:', err)
     res.json(ordersCache)
+  }
+})
+
+// Retrieve batch of orders by CID
+app.get('/api/orders/:cid', async (req, res) => {
+  const { cid } = req.params
+  try {
+    const parsed = CID.parse(cid)
+    const bytes = await heliaNode.blockstore.get(parsed)
+    const block = await decode({ cid: parsed, bytes, codec: raw, hasher: sha256 })
+    const orders = new TextDecoder().decode(block.value)
+    res.json(JSON.parse(orders))
+  } catch (err) {
+    res.status(500).json({ error: 'Could not retrieve orders for CID', details: err.message })
   }
 })
 
@@ -422,7 +438,7 @@ app.post('/api/connect-peer', async (req, res) => {
   }
 })
 
-// Graceful shutdown
+// Graceful shutdown: stop libp2p cleanly on SIGINT
 process.on('SIGINT', async () => {
   console.log('\nShutting down...')
   try {
@@ -435,8 +451,9 @@ process.on('SIGINT', async () => {
   }
 })
 
-// Start Express server and libp2p node
+// Start Express server only after libp2p and Helia are ready
 app.listen(PORT, async () => {
-  console.log(`🚀 Backend running at http://localhost:${PORT}`)
+  console.log(`🚀 Backend starting at http://localhost:${PORT}`)
   await startNode()
+  console.log('Backend ready to accept requests')
 })
