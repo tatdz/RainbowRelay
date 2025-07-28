@@ -7,18 +7,20 @@ const ENCRYPTION_KEY = ENCRYPTION_SECRET
   ? crypto.createHash('sha256').update(ENCRYPTION_SECRET).digest()
   : null
 
+// Encrypt order payload with AES-256-CTR zero IV
 function encryptOrder(order, key) {
   const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
   return Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()]).toString('hex')
 }
 
+// Decrypt order payload
 function decryptOrder(encryptedHex, key) {
   const encrypted = Buffer.from(encryptedHex, 'hex')
   const decipher = crypto.createDecipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
   return JSON.parse(Buffer.concat([decipher.update(encrypted), decipher.final()]).toString())
 }
 
-// Subscribe to a pubsub topic via backend API (assumes backend supports it)
+// Subscribe to a pubsub topic on backend via API
 async function subscribeToTopic(topic) {
   console.log(`Subscribing to pubsub topic "${topic}" via backend API...`)
   const res = await fetch(`${API_BASE}/subscribe`, {
@@ -34,6 +36,7 @@ async function subscribeToTopic(topic) {
   return data
 }
 
+// Join a dark pool by adding self to pool whitelist (this happens on backend on order post)
 async function joinDarkPool(poolName) {
   console.log(`Joining dark pool '${poolName}' by posting a dummy order (adds to whitelist)...`)
   const dummyOrder = { id: `join-pool:${Date.now()}`, timestamp: Date.now() }
@@ -54,7 +57,7 @@ async function joinDarkPool(poolName) {
   const data = await res.json()
   console.log(`Joined pool "${poolName}" result:`, data)
 
-  // Attempt to subscribe to the dark pool's pubsub topic via backend API
+  // Now subscribe this client to the dark pool topic so it receives pubsub messages
   const topic = `darkpool/${poolName}`
   try {
     await subscribeToTopic(topic)
@@ -63,6 +66,7 @@ async function joinDarkPool(poolName) {
   }
 }
 
+// Post private order to dark pool (encrypted)
 async function postPrivateOrder(order, poolName) {
   const payload = { order, poolName }
   if (ENCRYPTION_KEY) {
@@ -82,6 +86,7 @@ async function postPrivateOrder(order, poolName) {
   return data
 }
 
+// Fetch and decrypt private orders from dark pool
 async function fetchPrivateOrders(poolName) {
   const res = await fetch(`${API_BASE}/orders?pool=${encodeURIComponent(poolName)}`)
   if (!res.ok) {
@@ -94,6 +99,7 @@ async function fetchPrivateOrders(poolName) {
     return encryptedOrders
   }
 
+  // Decrypt each order if encrypted
   const decryptedOrders = encryptedOrders.map(o => {
     if (o.encrypted && o.data) {
       try {
@@ -108,6 +114,21 @@ async function fetchPrivateOrders(poolName) {
 
   console.log(`Decrypted orders from pool '${poolName}':`, decryptedOrders)
   return decryptedOrders
+}
+
+async function getBackendSubscriptions() {
+  // Optional: fetch current subscriptions from backend for diagnostics
+  try {
+    const res = await fetch(`${API_BASE}/subscriptions`)
+    if (res.ok) {
+      const subs = await res.json()
+      console.log('Backend current subscriptions:', subs)
+    } else {
+      console.warn('Could not fetch backend subscriptions:', await res.text())
+    }
+  } catch (e) {
+    console.warn('Error fetching backend subscriptions:', e.message)
+  }
 }
 
 async function main() {
@@ -126,16 +147,11 @@ async function main() {
     await postPrivateOrder(order, poolName)
     await fetchPrivateOrders(poolName)
 
-    // Diagnostic: fetch subscribed topics from backend (if you implement a /subscriptions endpoint)
-    try {
-      const subRes = await fetch(`${API_BASE}/subscriptions`)
-      if (subRes.ok) {
-        const subs = await subRes.json()
-        console.log('Currently subscribed topics on backend:', subs)
-      }
-    } catch (e) {
-      // Ignore if no such endpoint
+    if (!ENCRYPTION_KEY) {
+      console.log('No ENCRYPTION_KEY set; returning encrypted orders')
     }
+
+    await getBackendSubscriptions()
 
     console.log('✅ Dark pool client operations completed successfully.')
   } catch (err) {
