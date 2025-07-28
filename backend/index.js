@@ -27,8 +27,13 @@ import { sha256 } from 'multiformats/hashes/sha2'
 dotenv.config()
 
 const PORT = process.env.PORT || 3000
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null
+const ENCRYPTION_SECRET = process.env.ENCRYPTION_KEY || null
+const ENCRYPTION_KEY = ENCRYPTION_SECRET
+  ? crypto.createHash('sha256').update(ENCRYPTION_SECRET).digest()
+  : null
+
 const PROTOCOL = '/orders/1.0.0'
+const FLASH_PROTOCOL = '/orders/flash/1.0.0'
 
 const app = express()
 app.use(express.json())
@@ -39,42 +44,43 @@ let bitswap
 let ipfsOrdersCID = null
 let ordersCache = []
 
-// Encryption helpers (AES-256-CTR with zero IV)
-function encryptOrder(order, secret) {
-  const cipher = crypto.createCipheriv(
-    'aes-256-ctr',
-    Buffer.from(secret, 'utf8'),
-    Buffer.alloc(16, 0)
-  )
+// Memory structure for Dark Pools storing authorized peerIds per pool (simple whitelist)
+const darkPools = {
+  // Example: 'pool1': Set of peerIds authorized
+  // "pool1": new Set(['peerId1', 'peerId2']),
+}
+
+const flashChannelStreams = new Map() // peerId => stream
+
+function encryptOrder(order, key) {
+  const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(order)), cipher.final()])
   return encrypted.toString('hex')
 }
 
-function decryptOrder(encryptedHex, secret) {
+function decryptOrder(encryptedHex, key) {
   const encrypted = Buffer.from(encryptedHex, 'hex')
-  const decipher = crypto.createDecipheriv(
-    'aes-256-ctr',
-    Buffer.from(secret, 'utf8'),
-    Buffer.alloc(16, 0)
-  )
+  const decipher = crypto.createDecipheriv('aes-256-ctr', key, Buffer.alloc(16, 0))
   const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
   return JSON.parse(decrypted.toString())
 }
 
-// Protocol handler for /orders/1.0.0 streams
-async function onOrdersProtocol({ stream }) {
+function isPeerAuthorizedForPool(peerIdStr, poolName) {
+  if (!darkPools[poolName]) return false
+  return darkPools[poolName].has(peerIdStr)
+}
+
+async function onOrdersProtocol({ stream, connection }) {
   return new Promise((resolve) => {
     const parser = new JSONParser()
     let order = null
 
     parser.onValue = function (value) {
-      if (this.stack.length === 0) {
-        order = value
-      }
+      if (this.stack.length === 0) order = value
     }
 
     parser.onError = function (err) {
-      console.error('JSON parse error in streaming protocol:', err)
+      console.error('JSON parse error in orders stream:', err)
       resolve()
     }
 
@@ -85,22 +91,27 @@ async function onOrdersProtocol({ stream }) {
           parser.write(Buffer.from(bufferToParse))
         }
       } catch (err) {
-        console.error('Error reading stream:', err)
+        console.error('Error reading orders stream:', err)
       } finally {
         try {
           if (order) {
             let decryptedOrder = order
             if (ENCRYPTION_KEY) {
               try {
-                decryptedOrder = decryptOrder(JSON.stringify(order), ENCRYPTION_KEY)
+                if (typeof order === 'string') {
+                  decryptedOrder = decryptOrder(order, ENCRYPTION_KEY)
+                } else if (order.encrypted && typeof order.data === 'string') {
+                  decryptedOrder = decryptOrder(order.data, ENCRYPTION_KEY)
+                }
               } catch {
-                // fallback to original
+                // fallback, use as is
               }
             }
             const hash = JSON.stringify(decryptedOrder)
             if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
               ordersCache.push(decryptedOrder)
               console.log('📦 Received order via protocol:', decryptedOrder)
+              notifyFlashChannels(decryptedOrder)
             }
           }
         } catch (finalErr) {
@@ -112,40 +123,104 @@ async function onOrdersProtocol({ stream }) {
   })
 }
 
-// Connect to peer by multiaddr string
-async function connectToPeer(multiaddrStr) {
-  try {
-    let maddr = multiaddr(multiaddrStr)
-
-    if (!maddr.getPeerId()) {
-      const peerIdStr = multiaddrStr.split('/p2p/')[1]
-      if (peerIdStr) {
-        maddr = maddr.encapsulate(`/p2p/${peerIdStr}`)
+async function notifyFlashChannels(order) {
+  const encoded = new TextEncoder().encode(JSON.stringify(order))
+  for (const [peerId, stream] of flashChannelStreams.entries()) {
+    try {
+      if (stream && typeof stream.sink === 'function') {
+        await pipe([encoded], stream.sink)
+        console.log(`⚡ Sent flash notification to peer ${peerId}`)
       }
+    } catch (err) {
+      console.warn(`Failed to notify flash channel peer ${peerId}:`, err)
     }
-
-    if (maddr.getPeerId() === libp2pNode.peerId.toString()) {
-      throw new Error('Attempted to dial self peer ID, which is not allowed')
-    }
-
-    console.log(`Dialing peer at: ${maddr.toString()}`)
-
-    const connection = await libp2pNode.dial(maddr)
-    console.log('Connection established:', connection.remoteAddr.toString())
-
-    const stream = await connection.newStream([PROTOCOL])
-    console.log('Protocol stream opened')
-
-    if (stream.close) await stream.close()
-
-    return true
-  } catch (err) {
-    console.error('Failed to dial peer:', err)
-    throw new Error(`Failed to connect to peer ${multiaddrStr}: ${err.message}`)
   }
 }
 
-// Bitswap logger
+async function onFlashChannel({ stream, connection }) {
+  const peerIdStr = connection.remotePeer.toString()
+  console.log(`⚡ Flash channel stream opened from peer ${peerIdStr}`)
+  flashChannelStreams.set(peerIdStr, stream)
+
+  const heartbeatIntervalMs = 30_000
+
+  async function sendHeartbeat() {
+    if (stream && typeof stream.sink === 'function') {
+      try {
+        await pipe([new TextEncoder().encode(JSON.stringify({ type: 'heartbeat' }))], stream.sink)
+      } catch (err) {
+        console.error(`Heartbeat send error to peer ${peerIdStr}:`, err)
+      }
+    }
+  }
+
+  const interval = setInterval(sendHeartbeat, heartbeatIntervalMs)
+
+  try {
+    for await (const msg of stream.source) {
+      let bytes
+      if (msg && typeof msg.subarray === 'function') {
+        bytes = msg.subarray()
+      } else if (msg instanceof Uint8Array) {
+        bytes = msg
+      } else {
+        console.warn('⚠️ Received unexpected flash channel message format:', msg)
+        continue
+      }
+      const decoded = new TextDecoder().decode(bytes)
+      console.log(`⚡ Flash channel message received from ${peerIdStr}:`, decoded)
+    }
+  } catch (err) {
+    console.error('Flash channel error:', err)
+  } finally {
+    clearInterval(interval)
+    flashChannelStreams.delete(peerIdStr)
+    console.log(`⚡ Flash channel stream closed for peer ${peerIdStr}`)
+  }
+}
+
+/**
+ * Dynamically subscribe to a dark pool topic if not already subscribed.
+ * Useful to ensure receiving published messages in that pool.
+ * @param {string} poolName
+ */
+async function ensureDarkPoolSubscription(poolName) {
+  if (!poolName) return
+  const topic = `darkpool/${poolName}`
+  const subscribedTopics = libp2pNode.services.pubsub.getTopics()
+  if (!subscribedTopics.includes(topic)) {
+    try {
+      await libp2pNode.services.pubsub.subscribe(topic)
+      console.log(`✅ Subscribed to dark pool topic: ${topic}`)
+    } catch (err) {
+      console.warn(`⚠️ Failed to subscribe to dark pool topic ${topic}:`, err)
+    }
+  }
+}
+
+async function connectToPeer(multiaddrStr) {
+  try {
+    let maddr = multiaddr(multiaddrStr)
+    if (!maddr.getPeerId()) {
+      const peerIdStr = multiaddrStr.split('/p2p/')[1]
+      if (peerIdStr) maddr = maddr.encapsulate(`/p2p/${peerIdStr}`)
+    }
+    if (maddr.getPeerId() === libp2pNode.peerId.toString()) {
+      throw new Error('Cannot dial self peer ID')
+    }
+    console.log(`Dialing peer at: ${maddr.toString()}`)
+    const conn = await libp2pNode.dial(maddr)
+    console.log('Connection established:', conn.remoteAddr.toString())
+    const stream = await conn.newStream([PROTOCOL])
+    console.log('Protocol stream opened')
+    if (stream.close) await stream.close()
+    return true
+  } catch (err) {
+    console.error('Failed to dial peer:', err)
+    throw new Error(`Failed to connect: ${err.message}`)
+  }
+}
+
 const mockLogger = {
   forComponent: (name) => ({
     debug: (...args) => console.debug(`[${name}][DEBUG]`, ...args),
@@ -154,6 +229,32 @@ const mockLogger = {
     error: (...args) => console.error(`[${name}][ERROR]`, ...args),
   }),
 }
+
+// Added subscription endpoint
+app.post('/api/subscribe', async (req, res) => {
+  const { topic } = req.body
+  if (!topic || typeof topic !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid topic' })
+  }
+  try {
+    await libp2pNode.services.pubsub.subscribe(topic)
+    console.log(`✅ Subscribed to topic ${topic} via API request`)
+    res.json({ success: true, topic })
+  } catch (err) {
+    console.error('Failed to subscribe via API:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Optional: expose current subscriptions for diagnostics
+app.get('/api/subscriptions', (_req, res) => {
+  try {
+    const topics = libp2pNode.services.pubsub.getTopics()
+    res.json({ subscribedTopics: topics })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
 
 async function startNode() {
   libp2pNode = await createLibp2p({
@@ -172,9 +273,7 @@ async function startNode() {
       dht: kadDHT({
         enabled: true,
         clientMode: false,
-        randomWalk: {
-          enabled: true,
-        },
+        randomWalk: { enabled: true },
       }),
     },
     connectionManager: {
@@ -184,48 +283,44 @@ async function startNode() {
     },
   })
 
-  // Start the DHT explicitly for content routing capabilities
   await libp2pNode.services?.dht?.start()
 
-  // Assign KadDHT from libp2p to helia's contentRouting (this links DHT with Helia)
-  // Note: Helia may or may not set this internally; here we explicitly assign:
-  // This line must be after heliaNode is created later (see change below)
-  // So we'll assign after heliaNode setup in a bit.
-
-  const encryptionModules = libp2pNode.connectionEncrypters || []
-  console.log('Connection Encryption modules:', encryptionModules.map(p => p.protocol))
-
   libp2pNode.handle(PROTOCOL, onOrdersProtocol)
+  libp2pNode.handle(FLASH_PROTOCOL, onFlashChannel)
 
   libp2pNode.addEventListener('listening', () => {
-    console.log('Listening on multiaddrs (without peer ID):')
+    console.log('Listening on multiaddrs:')
     libp2pNode.getMultiaddrs().forEach(addr => console.log(addr.toString()))
-
-    const peerIdStr = libp2pNode.peerId.toString()
-    const addrsWithPeerId = libp2pNode.getMultiaddrs().map(addr =>
-      addr.encapsulate(`/p2p/${peerIdStr}`)
-    )
-    console.log('🎧 Listening on multiaddrs (with peer ID appended):')
-    addrsWithPeerId.forEach(addr => console.log(addr.toString()))
   })
 
   libp2pNode.addEventListener('peer:discovery', async (evt) => {
-    const peerId = evt.detail.id
-    console.log('Discovered peer:', peerId.toString())
-
+    const peerId = evt.detail.id.toString()
+    console.log('Discovered peer:', peerId)
     try {
-      const peer = await libp2pNode.peerStore.get(peerId)
-      if (peer.addresses.length > 0) {
-        const addrWithPeerId = peer.addresses[0].multiaddr.encapsulate(`/p2p/${peerId.toString()}`)
-        console.log(`Attempting to connect to discovered peer at: ${addrWithPeerId.toString()}`)
-        try {
-          await libp2pNode.dial(addrWithPeerId)
-          console.log('✅ Successfully connected to discovered peer')
-        } catch (err) {
-          console.error('Failed to connect to discovered peer:', err)
+      const peerInfo = await libp2pNode.peerStore.get(evt.detail.id)
+      if (peerInfo.addresses.length > 0) {
+        let authorized = false
+        for (const poolName of Object.keys(darkPools)) {
+          if (isPeerAuthorizedForPool(peerId, poolName)) {
+            authorized = true
+            break
+          }
         }
-      } else {
-        console.log('No addresses found for discovered peer.')
+        if (!authorized) {
+          authorized = true // For demo, all allowed
+        }
+        if (authorized) {
+          const addrWithPeer = peerInfo.addresses[0].multiaddr.encapsulate(`/p2p/${peerId}`)
+          console.log(`Attempting to connect to peer at: ${addrWithPeer}`)
+          try {
+            await libp2pNode.dial(addrWithPeer)
+            console.log('✅ Successfully connected to discovered peer')
+          } catch (err) {
+            console.error('Failed to connect to discovered peer:', err)
+          }
+        } else {
+          console.log(`Peer ${peerId} not authorized in dark pools; skipping dial`)
+        }
       }
     } catch (err) {
       console.error('Error retrieving peer info:', err)
@@ -236,16 +331,12 @@ async function startNode() {
     console.log('✅ Connected to peer:', evt.detail.toString())
   })
 
-  libp2pNode.addEventListener('connection:open', (evt) => {
-    console.log('🔗 Connection opened to:', evt.detail.remotePeer.toString())
-  })
-
   libp2pNode.addEventListener('peer:disconnect', (evt) => {
     console.log('🚫 Disconnected from peer:', evt.detail.toString())
   })
 
   await libp2pNode.start()
-  console.log('✅ Libp2p started with peerId:', libp2pNode.peerId.toString())
+  console.log('✅ libp2p started with peerId:', libp2pNode.peerId.toString())
 
   const blockstore = new LevelBlockstore('./helia-blockstore-db')
 
@@ -261,9 +352,6 @@ async function startNode() {
     bitswap,
   })
 
-  console.log('✅ Helia node started')
-
-  // Now link libp2p KadDHT as Helia contentRouting for provide/find
   if (libp2pNode.services?.dht) {
     heliaNode.contentRouting = libp2pNode.services.dht
     console.log('✅ Helia content routing assigned from libp2p KadDHT')
@@ -271,8 +359,19 @@ async function startNode() {
     console.warn('⚠️ Could not assign content routing to Helia (DHT missing)')
   }
 
+  // Subscribe to global public orders topic
   await libp2pNode.services.pubsub.subscribe('orders')
-  console.log('✅ Subscribed to "orders" topic')
+  console.log('✅ Subscribed to public "orders" topic')
+
+  // Periodic diagnostic logs for pubsub subscriptions & peers
+  setInterval(() => {
+    const topics = libp2pNode.services.pubsub.getTopics()
+    console.log('🔎 Currently subscribed pubsub topics:', topics)
+    for (const topic of topics) {
+      const peers = libp2pNode.services.pubsub.getPeers(topic)
+      console.log(`📡 Peers subscribed to ${topic}:`, peers.map(p => p.toString()))
+    }
+  }, 10_000)
 
   libp2pNode.services.pubsub.addEventListener('message', async (evt) => {
     try {
@@ -291,6 +390,7 @@ async function startNode() {
       if (!ordersCache.some(o => JSON.stringify(o) === hash)) {
         ordersCache.push(order)
         console.log('📦 Received order via pubsub:', order)
+        notifyFlashChannels(order)
       }
     } catch (err) {
       console.error('PubSub message error:', err)
@@ -298,13 +398,21 @@ async function startNode() {
   })
 }
 
-// Sync orders to IPFS via Helia and provide on network
-async function syncOrdersToIPFS(orders) {
-  const encoded = new TextEncoder().encode(JSON.stringify(orders))
+async function syncOrdersToIPFS(orders, poolName = null) {
+  let ordersToStore = orders
+  if (poolName && ENCRYPTION_KEY) {
+    ordersToStore = orders.map(order => ({
+      encrypted: true,
+      data: encryptOrder(order, ENCRYPTION_KEY),
+      pool: poolName,
+    }))
+  }
+
+  const encoded = new TextEncoder().encode(JSON.stringify(ordersToStore))
   const block = await encode({ value: encoded, codec: raw, hasher: sha256 })
   await heliaNode.blockstore.put(block.cid, block.bytes)
   ipfsOrdersCID = block.cid.toString()
-  ordersCache = orders
+  ordersCache = ordersToStore
 
   try {
     if (heliaNode.contentRouting?.provide) {
@@ -316,25 +424,45 @@ async function syncOrdersToIPFS(orders) {
   } catch (err) {
     console.warn('CID provide error:', err)
   }
+
+  const topic = poolName ? `darkpool/${poolName}` : 'orders'
+
+  if (poolName) {
+    await ensureDarkPoolSubscription(poolName)
+  }
+
+  try {
+    const pubData = new TextEncoder().encode(JSON.stringify(ordersToStore))
+    await libp2pNode.services.pubsub.publish(topic, pubData)
+    console.log(`📢 Published orders to ${topic}`)
+  } catch (err) {
+    console.warn(`Pubsub publish error on topic ${topic}:`, err)
+  }
+
   return ipfsOrdersCID
 }
 
-// Broadcast order to pubsub and protocol peers
-async function broadcastOrder(order) {
+async function broadcastOrder(order, poolName = null) {
   let dataToSend
-  if (ENCRYPTION_KEY) {
+  if (poolName && ENCRYPTION_KEY) {
     dataToSend = encryptOrder(order, ENCRYPTION_KEY)
   } else {
     dataToSend = JSON.stringify(order)
   }
   const encodedData = new TextEncoder().encode(dataToSend)
 
+  const topic = poolName ? `darkpool/${poolName}` : 'orders'
+
+  if (poolName) {
+    await ensureDarkPoolSubscription(poolName)
+  }
+
   try {
-    await libp2pNode.services.pubsub.publish('orders', encodedData)
-    console.log('📢 Published order to pubsub')
+    await libp2pNode.services.pubsub.publish(topic, encodedData)
+    console.log(`📢 Published single order to ${topic}`)
   } catch (err) {
     if (err.message.includes('NoPeersSubscribedToTopic')) {
-      console.log('⚠️ No peers subscribed to topic, skipping pubsub publish')
+      console.log(`⚠️ No peers subscribed to topic ${topic}, skipping pubsub publish`)
     } else {
       console.error('PubSub publish error:', err)
     }
@@ -367,7 +495,6 @@ async function broadcastOrder(order) {
   }
 }
 
-// Express API endpoints
 app.get('/api/peers', (_req, res) => {
   const peers = Array.from(libp2pNode.getPeers()).map(peerId => peerId.toString())
   res.json({ peers })
@@ -378,22 +505,32 @@ app.get('/api/addresses', (_req, res) => {
   res.json({ addresses })
 })
 
-app.get('/api/orders', async (_req, res) => {
+app.get('/api/orders', async (req, res) => {
+  const poolName = req.query.pool || null
+
   if (!ipfsOrdersCID) return res.json(ordersCache)
+
   try {
     const cid = CID.parse(ipfsOrdersCID)
     const bytes = await heliaNode.blockstore.get(cid)
     const block = await decode({ cid, bytes, codec: raw, hasher: sha256 })
-    const orders = new TextDecoder().decode(block.value)
-    ordersCache = JSON.parse(orders)
-    res.json(ordersCache)
+    let orders = new TextDecoder().decode(block.value)
+    orders = JSON.parse(orders)
+
+    if (poolName) {
+      orders = orders.filter(o => {
+        if (!o.pool && !poolName) return true
+        return o.pool === poolName
+      })
+    }
+
+    res.json(orders)
   } catch (err) {
     console.warn('IPFS read fallback to cache:', err)
     res.json(ordersCache)
   }
 })
 
-// Retrieve batch of orders by CID
 app.get('/api/orders/:cid', async (req, res) => {
   const { cid } = req.params
   try {
@@ -409,14 +546,27 @@ app.get('/api/orders/:cid', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const { orders, order } = req.body
+    const { orders, order, poolName } = req.body
+
+    if (poolName && !darkPools[poolName]) {
+      darkPools[poolName] = new Set()
+      console.log(`Created new dark pool '${poolName}'`)
+    }
+
+    if (poolName) {
+      if (libp2pNode?.peerId) {
+        darkPools[poolName].add(libp2pNode.peerId.toString())
+        console.log(`Added self to dark pool '${poolName}' whitelist`)
+      }
+    }
+
     if (orders) {
-      const ipfsCid = await syncOrdersToIPFS(orders)
+      const ipfsCid = await syncOrdersToIPFS(orders, poolName)
       return res.json({ success: true, cid: ipfsCid })
     }
     if (order) {
-      await broadcastOrder(order)
-      return res.json({ success: true, message: 'Order broadcasted', order })
+      await broadcastOrder(order, poolName)
+      return res.json({ success: true, message: `Order broadcasted in ${poolName || 'public'}`, order })
     }
     res.status(400).json({ error: 'Missing orders or order' })
   } catch (err) {
@@ -427,9 +577,8 @@ app.post('/api/orders', async (req, res) => {
 
 app.post('/api/connect-peer', async (req, res) => {
   const { multiaddr: multiaddrStr } = req.body
-  if (!multiaddrStr) {
-    return res.status(400).json({ error: 'Missing multiaddr' })
-  }
+  if (!multiaddrStr) return res.status(400).json({ error: 'Missing multiaddr' })
+
   try {
     await connectToPeer(multiaddrStr)
     res.json({ success: true, message: 'Connected to peer' })
@@ -438,7 +587,6 @@ app.post('/api/connect-peer', async (req, res) => {
   }
 })
 
-// Graceful shutdown: stop libp2p cleanly on SIGINT
 process.on('SIGINT', async () => {
   console.log('\nShutting down...')
   try {
@@ -451,7 +599,6 @@ process.on('SIGINT', async () => {
   }
 })
 
-// Start Express server only after libp2p and Helia are ready
 app.listen(PORT, async () => {
   console.log(`🚀 Backend starting at http://localhost:${PORT}`)
   await startNode()

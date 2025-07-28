@@ -50,6 +50,7 @@
     "libp2p": "^2.9.0",
     "multiformats": "^13.3.7",
     "node-fetch": "^3.3.2",
+    "uint8arraylist": "^2.4.8",
     "uint8arrays": "^5.1.0"
   }
 }
