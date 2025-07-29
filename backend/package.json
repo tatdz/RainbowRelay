@@ -6,7 +6,13 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "extensionsToTreatAsEsm": [],
+    "transform": {},
+    "setupFiles": ["<rootDir>/jest.setup.js"]
   },
   "keywords": [
     "helia",
@@ -40,6 +46,7 @@
     "blockstore-core": "^5.0.4",
     "blockstore-level": "^2.0.3",
     "cors": "^2.8.5",
+    "crypto": "^1.0.1",
     "dotenv": "^17.2.1",
     "ethers": "^6.15.0",
     "express": "^5.1.0",
@@ -52,7 +59,14 @@
     "libp2p": "^2.9.0",
     "multiformats": "^13.3.7",
     "node-fetch": "^3.3.2",
+    "supertest": "^7.1.4",
     "uint8arraylist": "^2.4.8",
     "uint8arrays": "^5.1.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.4",
+    "@testing-library/react": "^16.3.0",
+    "jest": "^30.0.5",
+    "react-test-renderer": "^19.1.1"
   }
 }

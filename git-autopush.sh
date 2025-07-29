@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Navigate to your local git repository folder
-cd /Users/tatianadzhambinova/RainbowRelay || {
+cd /Users/tatianadzhambinova/PonyHof || {
   echo "Error: Unable to access repo path"
   exit 1
 }
@@ -17,7 +17,7 @@ git commit -m "$commit_message" || {
 }
 
 # Push changes to origin main
-git push origin main || {
+git push PonyHof main || {
   echo "Failed to push changes"
   exit 1
 }
