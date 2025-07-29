@@ -9,7 +9,6 @@ function getEncryptionKey() {
   const secret = process.env.ENCRYPTION_KEY
   if (!secret) return null
   try {
-    // Return a 32-byte buffer from SHA256 hash of the secret string
     return crypto.createHash('sha256').update(secret).digest()
   } catch {
     return null
@@ -27,7 +26,7 @@ export function encryptOrder(order, key) {
     throw new Error('Invalid encryption key: must be 32 bytes')
   }
   const plaintext = JSON.stringify(order)
-  const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0)) // zero IV for CTR is safe here
+  const cipher = crypto.createCipheriv('aes-256-ctr', key, Buffer.alloc(16, 0)) // zero IV for CTR
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()])
   return encrypted.toString('hex')
 }
