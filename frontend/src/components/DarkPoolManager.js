@@ -1,24 +1,48 @@
-import React, { useState } from 'react'
-import { joinPool } from '../api'
+import React, { useState } from 'react';
+import { joinPool } from '../api';
 
-export default function DarkPoolManager({ peerId }) {
-  const [poolName, setPoolName] = useState('')
+const DarkPoolManager = ({ peerId }) => {
+  const [poolName, setPoolName] = useState('');
+  const [error, setError] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
 
-  async function handleJoin() {
-    if (!poolName) return alert('Enter pool name')
+  const handleJoinPool = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setIsLoading(true);
+
     try {
-      const res = await joinPool(poolName, peerId)
-      alert(res.success ? `Joined ${poolName}` : 'Failed to join pool')
-    } catch (e) {
-      alert('Error joining pool: ' + e.message)
+      const result = await joinPool(poolName, peerId);
+      if (result.success) {
+        alert(`Joined ${poolName}`);
+      } else {
+        setError('Failed to join pool');
+      }
+    } catch (err) {
+      setError(err.message || 'Failed to join pool');
+    } finally {
+      setIsLoading(false);
     }
-  }
+  };
 
   return (
     <div>
-      <h3>Join a Dark Pool</h3>
-      <input value={poolName} onChange={e => setPoolName(e.target.value)} placeholder="Pool Name"/>
-      <button onClick={handleJoin}>Join Pool</button>
+      <h2>Join Dark Pool</h2>
+      {error && <div className="error">{error}</div>}
+      <form onSubmit={handleJoinPool}>
+        <input
+          type="text"
+          placeholder="Pool Name"
+          value={poolName}
+          onChange={(e) => setPoolName(e.target.value)}
+          required
+        />
+        <button type="submit" disabled={isLoading}>
+          {isLoading ? 'Joining...' : 'Join Pool'}
+        </button>
+      </form>
     </div>
-  )
-}
+  );
+};
+
+export default DarkPoolManager;

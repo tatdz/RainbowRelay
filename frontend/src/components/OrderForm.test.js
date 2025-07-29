@@ -1,37 +1,119 @@
-import React from 'react'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import OrderForm from '../../frontend/src/components/OrderForm'
-import * as api from '../../frontend/src/api'
-import * as utils from '../../frontend/src/utils'
+import React from 'react';
+import { render, screen, act, waitFor } from '@testing-library/react';
+import '@testing-library/jest-dom';
+import userEvent from '@testing-library/user-event';
+import OrderForm from './OrderForm';
 
-jest.mock('../../frontend/src/api')
-jest.mock('../../frontend/src/utils')
+jest.mock('../api', () => ({
+  submitOrder: jest.fn()
+}));
 
-describe('OrderForm component', () => {
+jest.mock('../utils', () => ({
+  signOrder: jest.fn()
+}));
+
+jest.mock('ethers', () => {
+  const original = jest.requireActual('ethers');
+  return {
+    ...original,
+    BrowserProvider: jest.fn().mockImplementation(() => ({
+      getSigner: jest.fn().mockImplementation(() => ({
+        getAddress: jest.fn().mockResolvedValue('0x123')
+      }))
+    })),
+    ZeroAddress: '0x0000000000000000000000000000000000000000'
+  };
+});
+
+describe('OrderForm', () => {
+  const mockPeerId = '0x1234567890abcdef';
+
   beforeEach(() => {
-    window.ethereum = { request: jest.fn() }
-  })
+    jest.clearAllMocks();
+    window.ethereum = { request: jest.fn() };
+  });
 
-  test('renders form inputs and submits order', async () => {
-    utils.signOrder.mockResolvedValue({ signature: '0xsig', makerToken: 't', takerToken: 't', makerAmount: '1', takerAmount: '1', maker: '0x1', taker: '0x0', expiry: 1, nonce: 1 })
-    api.submitOrder.mockResolvedValue({success: true})
+  test('renders all form fields', async () => {
+    await act(async () => {
+      render(<OrderForm peerId={mockPeerId} />);
+    });
 
-    render(<OrderForm peerId="0x1" />)
-    fireEvent.change(screen.getByPlaceholderText(/Maker Token Address/i), { target: { value: '0xmaker' } })
-    fireEvent.change(screen.getByPlaceholderText(/Taker Token Address/i), { target: { value: '0xtaker' } })
-    fireEvent.change(screen.getByPlaceholderText(/Maker Amount/i), { target: { value: '1' } })
-    fireEvent.change(screen.getByPlaceholderText(/Taker Amount/i), { target: { value: '1' } })
+    expect(screen.getByLabelText(/Maker Token Address/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Taker Token Address/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Maker Amount/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Taker Amount/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign & Submit/i })).toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByText(/Sign & Submit/i))
+  test('submits order successfully', async () => {
+    const user = userEvent.setup();
+    const mockSubmitOrder = require('../api').submitOrder;
+    const mockSignOrder = require('../utils').signOrder;
+    
+    mockSignOrder.mockResolvedValue({ 
+      signature: '0xsig',
+      makerToken: '0xmaker',
+      takerToken: '0xtaker',
+      makerAmount: '100',
+      takerAmount: '200',
+      maker: '0x123',
+      taker: '0x000',
+      expiry: 1234567890,
+      nonce: 1
+    });
+    mockSubmitOrder.mockResolvedValue({ success: true });
 
-    await waitFor(() => expect(screen.getByText(/Order submitted!/i)).toBeInTheDocument())
-  })
+    await act(async () => {
+      render(<OrderForm peerId={mockPeerId} />);
+    });
 
-  test('shows error if MetaMask missing', async () => {
-    delete window.ethereum
-    render(<OrderForm peerId="0x1" />)
+    await act(async () => {
+      await user.type(screen.getByLabelText(/Maker Token Address/i), '0xmaker');
+      await user.type(screen.getByLabelText(/Taker Token Address/i), '0xtaker');
+      await user.type(screen.getByLabelText(/Maker Amount/i), '100');
+      await user.type(screen.getByLabelText(/Taker Amount/i), '200');
+    });
 
-    fireEvent.click(screen.getByText(/Sign & Submit/i))
-    expect(await screen.findByText(/MetaMask not detected/i)).toBeInTheDocument()
-  })
-})
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
+    });
+
+    await waitFor(() => {
+      expect(mockSubmitOrder).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(/successfully submitted/i)).toBeInTheDocument();
+    });
+  });
+
+  test('shows error when MetaMask is not available', async () => {
+    const user = userEvent.setup();
+    delete window.ethereum;
+
+    await act(async () => {
+      render(<OrderForm peerId={mockPeerId} />);
+    });
+
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
+    });
+
+    expect(screen.getByText(/MetaMask wallet is required/i)).toBeInTheDocument();
+  });
+
+  test('shows error when submission fails', async () => {
+    const user = userEvent.setup();
+    const errorMessage = 'Submission failed';
+    require('../api').submitOrder.mockRejectedValue(new Error(errorMessage));
+
+    await act(async () => {
+      render(<OrderForm peerId={mockPeerId} />);
+    });
+
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(errorMessage)).toBeInTheDocument();
+    });
+  });
+});

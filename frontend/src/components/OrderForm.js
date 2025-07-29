@@ -1,113 +1,89 @@
-import React, { useState } from 'react'
+import React from 'react'
+import { render, screen, waitFor, act } from '@testing-library/react'
+import '@testing-library/jest-dom'
+import userEvent from '@testing-library/user-event'
+import OrderForm from './OrderForm'
 import { ethers } from 'ethers'
-import { signOrder } from '../utils'
-import { submitOrder } from '../api'
 
-export default function OrderForm({ peerId }) {
-  const [makerToken, setMakerToken] = useState('')
-  const [takerToken, setTakerToken] = useState('')
-  const [makerAmount, setMakerAmount] = useState('')
-  const [takerAmount, setTakerAmount] = useState('')
-  const [poolName, setPoolName] = useState('public')
-  const [message, setMessage] = useState('')
+jest.mock('../api', () => ({
+  submitOrder: jest.fn()
+}))
 
-  async function handleSubmit(e) {
-    e.preventDefault()
-    if (!window.ethereum) {
-      setMessage('MetaMask wallet is required')
-      return
-    }
-    try {
-      const metamaskProvider = new ethers.BrowserProvider(window.ethereum)
-      await metamaskProvider.send('eth_requestAccounts', [])
-      const signer = metamaskProvider.getSigner()
-      const address = await signer.getAddress()
+jest.mock('../utils', () => ({
+  signOrder: jest.fn()
+}))
 
-      const order = {
-        makerToken,
-        takerToken,
-        makerAmount: ethers.parseUnits(makerAmount, 18).toString(),
-        takerAmount: ethers.parseUnits(takerAmount, 18).toString(),
-        maker: address,
-        taker: ethers.ZeroAddress,
-        expiry: Math.floor(Date.now() / 1000) + 3600, // Expires 1 hour from now
-        nonce: Math.floor(Math.random() * 1_000_000),
-      }
-
-      const signedOrder = await signOrder(order, signer)
-      const res = await submitOrder(signedOrder, poolName === 'public' ? null : poolName)
-      if (res.success) {
-        setMessage('✅ Order successfully submitted to PonyHof')
-      } else {
-        setMessage(`❌ Submission failed: ${res.error || 'unknown error'}`)
-      }
-    } catch (err) {
-      setMessage(`Error signing or submitting order: ${err.message}`)
-    }
+jest.mock('ethers', () => {
+  const original = jest.requireActual('ethers')
+  return {
+    ...original,
+    BrowserProvider: jest.fn().mockImplementation(() => ({
+      send: jest.fn().mockResolvedValue(null),
+      getSigner: jest.fn().mockImplementation(() => ({
+        getAddress: jest.fn().mockResolvedValue('0x123')
+      }))
+    }))
   }
+})
 
-  return (
-    <form onSubmit={handleSubmit} style={{ marginBottom: '2rem' }}>
-      <h3>Submit a Limit Order</h3>
+describe('OrderForm component', () => {
+  beforeEach(() => {
+    window.ethereum = { request: jest.fn() }
+  })
 
-      <label>
-        Maker Token Address<br/>
-        <input
-          type="text"
-          value={makerToken}
-          onChange={(e) => setMakerToken(e.target.value)}
-          placeholder="0x..."
-          required
-          style={{ width: '100%' }}
-        />
-      </label>
+  test('renders form inputs and submits order', async () => {
+    const user = userEvent.setup()
+    const mockSignOrder = require('../utils').signOrder
+    const mockSubmitOrder = require('../api').submitOrder
+    
+    mockSignOrder.mockResolvedValue({ 
+      signature: '0xsig', 
+      makerToken: 't', 
+      takerToken: 't', 
+      makerAmount: '1', 
+      takerAmount: '1', 
+      maker: '0x1', 
+      taker: '0x0', 
+      expiry: 1, 
+      nonce: 1 
+    })
+    mockSubmitOrder.mockResolvedValue({success: true})
 
-      <label>
-        Taker Token Address<br/>
-        <input
-          type="text"
-          value={takerToken}
-          onChange={(e) => setTakerToken(e.target.value)}
-          placeholder="0x..."
-          required
-          style={{ width: '100%' }}
-        />
-      </label>
+    await act(async () => {
+      render(<OrderForm peerId="0x1" />)
+    })
+    
+    // Fill out form
+    await act(async () => {
+      await user.type(screen.getByLabelText(/Maker Token Address/i), '0xmaker')
+      await user.type(screen.getByLabelText(/Taker Token Address/i), '0xtaker')
+      await user.type(screen.getByLabelText(/Maker Amount/i), '1')
+      await user.type(screen.getByLabelText(/Taker Amount/i), '1')
+    })
 
-      <label>
-        Maker Amount<br/>
-        <input
-          type="number"
-          step="any"
-          value={makerAmount}
-          onChange={(e) => setMakerAmount(e.target.value)}
-          required
-        />
-      </label>
+    // Submit form
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }))
+    })
 
-      <label>
-        Taker Amount<br/>
-        <input
-          type="number"
-          step="any"
-          value={takerAmount}
-          onChange={(e) => setTakerAmount(e.target.value)}
-          required
-        />
-      </label>
+    // Verify success message
+    await waitFor(() => {
+      expect(screen.getByText(/successfully submitted/i)).toBeInTheDocument()
+    })
+  })
 
-      <label>
-        Select Dark Pool<br/>
-        <select value={poolName} onChange={(e) => setPoolName(e.target.value)}>
-          <option value="public">Public Pool</option>
-          <option value="whales">Whales Pool</option>
-          <option value="institutions">Institutions Pool</option>
-        </select>
-      </label>
+  test('shows error if MetaMask missing', async () => {
+    const user = userEvent.setup()
+    delete window.ethereum
+    
+    await act(async () => {
+      render(<OrderForm peerId="0x1" />)
+    })
 
-      <br />
-      <button type="submit">Sign & Submit Order</button>
-      <p style={{ marginTop: '1rem', fontWeight: 'bold' }}>{message}</p>
-    </form>
-  )
-}
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }))
+    })
+    
+    expect(await screen.findByText(/MetaMask wallet is required/i)).toBeInTheDocument()
+  })
+})
