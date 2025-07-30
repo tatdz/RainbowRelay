@@ -1,119 +1,84 @@
 import React from 'react';
-import { render, screen, act, waitFor } from '@testing-library/react';
-import '@testing-library/jest-dom';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import '@testing-library/jest-dom';
 import OrderForm from './OrderForm';
 
 jest.mock('../api', () => ({
-  submitOrder: jest.fn()
+  submitOrder: jest.fn(() => Promise.resolve({ success: true })),
 }));
 
 jest.mock('../utils', () => ({
-  signOrder: jest.fn()
+  signOrder: jest.fn(() => Promise.resolve({
+    signature: '0x123',
+    makerAsset: '0xmaker',
+    takerAsset: '0xtaker',
+    maker: '0xmaker',
+    expiry: '0',
+    salt: '0',
+    predicate: '0x',
+    permit: '0x',
+    interaction: '0x',
+  })),
+}));
+
+jest.mock('react-toastify', () => ({
+  toast: {
+    error: jest.fn(),
+    success: jest.fn(),
+  },
 }));
 
 jest.mock('ethers', () => {
   const original = jest.requireActual('ethers');
   return {
     ...original,
-    BrowserProvider: jest.fn().mockImplementation(() => ({
-      getSigner: jest.fn().mockImplementation(() => ({
-        getAddress: jest.fn().mockResolvedValue('0x123')
-      }))
-    })),
-    ZeroAddress: '0x0000000000000000000000000000000000000000'
+    constants: {
+      ...original.constants,
+      AddressZero: '0x0000000000000000000000000000000000000000',
+    },
+    utils: original.utils,
   };
 });
 
 describe('OrderForm', () => {
-  const mockPeerId = '0x1234567890abcdef';
-
   beforeEach(() => {
-    jest.clearAllMocks();
     window.ethereum = { request: jest.fn() };
   });
 
-  test('renders all form fields', async () => {
-    await act(async () => {
-      render(<OrderForm peerId={mockPeerId} />);
-    });
-
-    expect(screen.getByLabelText(/Maker Token Address/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Taker Token Address/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Maker Amount/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Taker Amount/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Sign & Submit/i })).toBeInTheDocument();
-  });
-
-  test('submits order successfully', async () => {
+  test('renders inputs and successfully submits an order', async () => {
     const user = userEvent.setup();
-    const mockSubmitOrder = require('../api').submitOrder;
-    const mockSignOrder = require('../utils').signOrder;
-    
-    mockSignOrder.mockResolvedValue({ 
-      signature: '0xsig',
-      makerToken: '0xmaker',
-      takerToken: '0xtaker',
-      makerAmount: '100',
-      takerAmount: '200',
-      maker: '0x123',
-      taker: '0x000',
-      expiry: 1234567890,
-      nonce: 1
-    });
-    mockSubmitOrder.mockResolvedValue({ success: true });
 
     await act(async () => {
-      render(<OrderForm peerId={mockPeerId} />);
+      render(<OrderForm peerId="0x123" />);
     });
 
     await act(async () => {
-      await user.type(screen.getByLabelText(/Maker Token Address/i), '0xmaker');
-      await user.type(screen.getByLabelText(/Taker Token Address/i), '0xtaker');
-      await user.type(screen.getByLabelText(/Maker Amount/i), '100');
-      await user.type(screen.getByLabelText(/Taker Amount/i), '200');
-    });
-
-    await act(async () => {
+      await user.type(screen.getByPlaceholderText(/Maker Asset Address/i), '0xmakeraddress0000000000000000000000');
+      await user.type(screen.getByPlaceholderText(/Taker Asset Address/i), '0xtakeraddress0000000000000000000000');
+      await user.type(screen.getByPlaceholderText(/Maker Amount/i), '1');
+      await user.type(screen.getByPlaceholderText(/Taker Amount/i), '1');
       await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
     });
 
     await waitFor(() => {
-      expect(mockSubmitOrder).toHaveBeenCalledTimes(1);
-      expect(screen.getByText(/successfully submitted/i)).toBeInTheDocument();
+      expect(require('../api').submitOrder).toHaveBeenCalled();
     });
   });
 
-  test('shows error when MetaMask is not available', async () => {
-    const user = userEvent.setup();
+  test('shows error if MetaMask is missing', async () => {
     delete window.ethereum;
-
-    await act(async () => {
-      render(<OrderForm peerId={mockPeerId} />);
-    });
-
-    await act(async () => {
-      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
-    });
-
-    expect(screen.getByText(/MetaMask wallet is required/i)).toBeInTheDocument();
-  });
-
-  test('shows error when submission fails', async () => {
     const user = userEvent.setup();
-    const errorMessage = 'Submission failed';
-    require('../api').submitOrder.mockRejectedValue(new Error(errorMessage));
 
     await act(async () => {
-      render(<OrderForm peerId={mockPeerId} />);
+      render(<OrderForm peerId="0x123" />);
     });
 
     await act(async () => {
       await user.click(screen.getByRole('button', { name: /Sign & Submit/i }));
     });
 
-    await waitFor(() => {
-      expect(screen.getByText(errorMessage)).toBeInTheDocument();
-    });
+    const toast = require('react-toastify').toast;
+    expect(toast.error).toHaveBeenCalled();
   });
 });

@@ -1,89 +1,136 @@
-import React from 'react'
-import { render, screen, waitFor, act } from '@testing-library/react'
-import '@testing-library/jest-dom'
-import userEvent from '@testing-library/user-event'
-import OrderForm from './OrderForm'
+import React, { useState, useEffect } from 'react'
+import StakingPredicateInput from './StakingPredicateInput'
 import { ethers } from 'ethers'
+import { signOrder } from '../utils'
+import { submitOrder } from '../api'
+import { toast } from 'react-toastify'
 
-jest.mock('../api', () => ({
-  submitOrder: jest.fn()
-}))
+export default function OrderForm({ peerId }) {
+  const [makerAsset, setMakerAsset] = useState('')
+  const [takerAsset, setTakerAsset] = useState('')
+  const [makerAmount, setMakerAmount] = useState('')
+  const [takerAmount, setTakerAmount] = useState('')
+  const [privateOrder, setPrivateOrder] = useState(false)
+  const [encryptKey, setEncryptKey] = useState('')
+  const [vestingPredicateEnabled, setVestingPredicateEnabled] = useState(false)
+  const [vestingPredicate, setVestingPredicate] = useState('0x')
+  const [gasStationEnabled, setGasStationEnabled] = useState(false)
+  const [gasStationAddress, setGasStationAddress] = useState('')
+  const [stakingPredicateHex, setStakingPredicateHex] = useState('0x')
 
-jest.mock('../utils', () => ({
-  signOrder: jest.fn()
-}))
-
-jest.mock('ethers', () => {
-  const original = jest.requireActual('ethers')
-  return {
-    ...original,
-    BrowserProvider: jest.fn().mockImplementation(() => ({
-      send: jest.fn().mockResolvedValue(null),
-      getSigner: jest.fn().mockImplementation(() => ({
-        getAddress: jest.fn().mockResolvedValue('0x123')
-      }))
-    }))
+  // Compose predicates if vesting or staking enabled (simple or combined via 1inch predicate sdk can be added)
+  function composePredicate() {
+    if (vestingPredicateEnabled && stakingPredicateHex !== '0x') {
+      // Simple concatenation or better predicate composition with sdk can be done here
+      return stakingPredicateHex
+    }
+    if (vestingPredicateEnabled) return vestingPredicate
+    if (stakingPredicateHex !== '0x') return stakingPredicateHex
+    return '0x'
   }
-})
 
-describe('OrderForm component', () => {
-  beforeEach(() => {
-    window.ethereum = { request: jest.fn() }
-  })
+  async function onSubmit(e) {
+    e.preventDefault()
+    if (!makerAsset || !takerAsset || !makerAmount || !takerAmount) {
+      toast.error('Fill all form fields')
+      return
+    }
 
-  test('renders form inputs and submits order', async () => {
-    const user = userEvent.setup()
-    const mockSignOrder = require('../utils').signOrder
-    const mockSubmitOrder = require('../api').submitOrder
-    
-    mockSignOrder.mockResolvedValue({ 
-      signature: '0xsig', 
-      makerToken: 't', 
-      takerToken: 't', 
-      makerAmount: '1', 
-      takerAmount: '1', 
-      maker: '0x1', 
-      taker: '0x0', 
-      expiry: 1, 
-      nonce: 1 
-    })
-    mockSubmitOrder.mockResolvedValue({success: true})
+    const predicate = composePredicate()
+    let interaction = '0x'
+    if (gasStationEnabled) {
+      if (!ethers.utils.isAddress(gasStationAddress)) {
+        toast.error('Invalid Gas Station Contract Address')
+        return
+      }
+      interaction = '0x43e8eb1a' // onFill selector
+    }
 
-    await act(async () => {
-      render(<OrderForm peerId="0x1" />)
-    })
-    
-    // Fill out form
-    await act(async () => {
-      await user.type(screen.getByLabelText(/Maker Token Address/i), '0xmaker')
-      await user.type(screen.getByLabelText(/Taker Token Address/i), '0xtaker')
-      await user.type(screen.getByLabelText(/Maker Amount/i), '1')
-      await user.type(screen.getByLabelText(/Taker Amount/i), '1')
-    })
+    const limitOrder = {
+      makerAsset,
+      takerAsset,
+      maker: peerId,
+      receiver: ethers.constants.AddressZero,
+      allowedSender: ethers.constants.AddressZero,
+      makingAmount: ethers.utils.parseUnits(makerAmount, 18).toString(),
+      takingAmount: ethers.utils.parseUnits(takerAmount, 18).toString(),
+      salt: ethers.BigNumber.from(ethers.utils.randomBytes(32)).toString(),
+      predicate,
+      permit: '0x',
+      interaction,
+    }
 
-    // Submit form
-    await act(async () => {
-      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }))
-    })
+    try {
+      const orderWithSignature = await signOrder(limitOrder)
+      const payload = privateOrder
+        ? {
+            order: null,
+            signature: null,
+            metadata: null,
+            encrypted: true,
+            encryptKey,
+            data: /* encrypt with encryptKey */ JSON.stringify(orderWithSignature),
+          }
+        : {
+            order: orderWithSignature,
+            signature: orderWithSignature.signature,
+            metadata: { submittedAt: Date.now() },
+            encrypted: false,
+            encryptKey: '',
+          }
 
-    // Verify success message
-    await waitFor(() => {
-      expect(screen.getByText(/successfully submitted/i)).toBeInTheDocument()
-    })
-  })
+      const res = await submitOrder(payload, null)
+      if (res.success) toast.success('Order submitted successfully!')
+      else toast.error('Order submission failed')
+    } catch (err) {
+      toast.error('Error signing/submitting order: ' + err.message)
+    }
+  }
 
-  test('shows error if MetaMask missing', async () => {
-    const user = userEvent.setup()
-    delete window.ethereum
-    
-    await act(async () => {
-      render(<OrderForm peerId="0x1" />)
-    })
-
-    await act(async () => {
-      await user.click(screen.getByRole('button', { name: /Sign & Submit/i }))
-    })
-    
-    expect(await screen.findByText(/MetaMask wallet is required/i)).toBeInTheDocument()
-  })
-})
+  return (
+    <form onSubmit={onSubmit}>
+      <h2>Create Limit Order</h2>
+      <input placeholder="Maker Asset Address" value={makerAsset} onChange={e => setMakerAsset(e.target.value)} />
+      <input placeholder="Taker Asset Address" value={takerAsset} onChange={e => setTakerAsset(e.target.value)} />
+      <input placeholder="Maker Amount (decimals)" value={makerAmount} onChange={e => setMakerAmount(e.target.value)} />
+      <input placeholder="Taker Amount (decimals)" value={takerAmount} onChange={e => setTakerAmount(e.target.value)} />
+      <label>
+        Private Order? <input type="checkbox" checked={privateOrder} onChange={e => setPrivateOrder(e.target.checked)} />
+      </label>
+      {privateOrder && (
+        <input
+          type="password"
+          placeholder="Encryption Key"
+          value={encryptKey}
+          onChange={e => setEncryptKey(e.target.value)}
+        />
+      )}
+      <label>
+        Enable Vesting Predicate? <input type="checkbox" checked={vestingPredicateEnabled} onChange={e => setVestingPredicateEnabled(e.target.checked)} />
+      </label>
+      {vestingPredicateEnabled && (
+        <input
+          type="text"
+          placeholder="Enter vesting predicate hex"
+          value={vestingPredicate}
+          onChange={e => setVestingPredicate(e.target.value)}
+        />
+      )}
+      <label>
+        Enable Staking Predicate? {/* Controlled in separate component */}
+      </label>
+      <StakingPredicateInput onChange={setStakingPredicateHex} />
+      <label>
+        Use Gas Station Extension? <input type="checkbox" checked={gasStationEnabled} onChange={e => setGasStationEnabled(e.target.checked)} />
+      </label>
+      {gasStationEnabled && (
+        <input
+          placeholder="Gas Station Contract Address"
+          value={gasStationAddress}
+          onChange={e => setGasStationAddress(e.target.value)}
+        />
+      )}
+      <button type="submit">Sign & Submit Order</button>
+    </form>
+  )
+}

@@ -1,7 +1,7 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "RainbowRelay backend using Helia and libp2p",
+  "description": "PonyHof backend using Helia and libp2p",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "unixfs",
     "backend"
   ],
-  "author": "Tatiana Dzhambinova",
+  "author": "",
   "license": "ISC",
   "dependencies": {
     "@chainsafe/libp2p-gossipsub": "^14.1.1",
@@ -45,6 +45,7 @@
     "ethers": "^6.15.0",
     "express": "^5.1.0",
     "helia": "^5.5.0",
+    "ipfs-http-client": "^60.0.1",
     "ipfs-unixfs-exporter": "^13.6.6",
     "ipfs-unixfs-importer": "^15.4.0",
     "it-pipe": "^3.0.1",
