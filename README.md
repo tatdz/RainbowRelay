@@ -98,7 +98,7 @@ The flexible P2P relay design allows custom order logic and pool membership sema
 
 ### Blockchain Infrastructure
 - **Sepolia RPC Provider**: Alchemy or Infura for Ethereum connectivity
-- **1inch Protocol Contracts**: LimitOrderProtocol and GasStationOnFill
+- **1inch Protocol Contracts**: LimitOrderProtocol https://sepolia.etherscan.io/address/0x99756dace63b4b8b4225729b93e9a9b6d535d68c and GasStationOnFill https://sepolia.etherscan.io/address/0x14d4dfc203f1a1a748cbecdc2ac70a60d7f9d010
 - **MetaMask**: Browser wallet for user authentication and signing
 
 ### P2P Network
